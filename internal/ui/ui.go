@@ -9,14 +9,24 @@ import (
 
 // Colors (simple ANSI — no external deps).
 const (
-	reset   = "\033[0m"
-	red     = "\033[31m"
-	green   = "\033[32m"
-	yellow  = "\033[33m"
-	blue    = "\033[34m"
-	cyan    = "\033[36m"
-	gray    = "\033[90m"
-	bold    = "\033[1m"
+	reset  = "\033[0m"
+	red    = "\033[31m"
+	green  = "\033[32m"
+	yellow = "\033[33m"
+	blue   = "\033[34m"
+	cyan   = "\033[36m"
+	gray   = "\033[90m"
+	bold   = "\033[1m"
+)
+
+// Symbols used in output. On Windows terminals that don't support Unicode
+// (legacy cmd.exe), we fall back to ASCII equivalents.
+var (
+	symSuccess = "✓"
+	symError   = "✗"
+	symInfo    = "ℹ"
+	symWarn    = "⚠"
+	symLine    = "─"
 )
 
 // isTTY checks if stdout is a terminal.
@@ -28,8 +38,13 @@ func isTTY() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
+// useColor returns true if we should emit ANSI color codes. On Windows we
+// only colorize when stdout is a terminal AND we've successfully enabled VT
+// processing (or are running in a modern terminal that supports it natively).
+var colorEnabled = enableColor()
+
 func colorize(c, s string) string {
-	if !isTTY() {
+	if !colorEnabled {
 		return s
 	}
 	return c + s + reset
@@ -37,28 +52,28 @@ func colorize(c, s string) string {
 
 // Success prints a green success message.
 func Success(format string, args ...interface{}) {
-	fmt.Println(colorize(green, "✓ ") + fmt.Sprintf(format, args...))
+	fmt.Println(colorize(green, symSuccess+" ") + fmt.Sprintf(format, args...))
 }
 
 // Error prints a red error message.
 func Error(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, colorize(red, "✗ ")+fmt.Sprintf(format, args...)+"\n")
+	fmt.Fprintf(os.Stderr, colorize(red, symError+" ")+fmt.Sprintf(format, args...)+"\n")
 }
 
 // Info prints a blue info message.
 func Info(format string, args ...interface{}) {
-	fmt.Println(colorize(blue, "ℹ ") + fmt.Sprintf(format, args...))
+	fmt.Println(colorize(blue, symInfo+" ") + fmt.Sprintf(format, args...))
 }
 
 // Warn prints a yellow warning message.
 func Warn(format string, args ...interface{}) {
-	fmt.Println(colorize(yellow, "⚠ ") + fmt.Sprintf(format, args...))
+	fmt.Println(colorize(yellow, symWarn+" ") + fmt.Sprintf(format, args...))
 }
 
 // Header prints a bold section header.
 func Header(format string, args ...interface{}) {
 	fmt.Println(colorize(bold, fmt.Sprintf(format, args...)))
-	fmt.Println(strings.Repeat("─", 40))
+	fmt.Println(strings.Repeat(symLine, 40))
 }
 
 // Table prints rows in a tab-aligned format.

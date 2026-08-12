@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Test & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build (current platform)
+        run: go build -ldflags "-X main.version=dev" -trimpath .
+
+      - name: Cross-compile all platforms
+        run: make dist
+
+      - name: Verify binaries
+        run: |
+          ls -lh dist/
+          file dist/airbuild-windows-amd64.exe
+          file dist/airbuild-darwin-arm64

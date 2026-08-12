@@ -5,23 +5,48 @@ your apps, builds, and install links — no Node.js or npm required.
 
 ## Install
 
-### From binary (recommended)
+### One-liner (macOS & Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/airbuild/cli/main/install.sh | bash
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/airbuild/cli/main/install.ps1 | iex
+```
+
+### From binary (manual)
 
 Download the latest binary for your platform from
-[GitHub Releases](https://github.com/airbuild/airbuild/releases):
+[GitHub Releases](https://github.com/airbuild/cli/releases):
 
 ```bash
 # macOS (Apple Silicon)
-curl -L https://github.com/airbuild/airbuild/releases/latest/download/airbuild-darwin-arm64 -o airbuild
+curl -L https://github.com/airbuild/cli/releases/latest/download/airbuild-darwin-arm64 -o airbuild
 chmod +x airbuild && sudo mv airbuild /usr/local/bin/
 
 # macOS (Intel)
-curl -L https://github.com/airbuild/airbuild/releases/latest/download/airbuild-darwin-amd64 -o airbuild
+curl -L https://github.com/airbuild/cli/releases/latest/download/airbuild-darwin-amd64 -o airbuild
 chmod +x airbuild && sudo mv airbuild /usr/local/bin/
 
-# Linux
-curl -L https://github.com/airbuild/airbuild/releases/latest/download/airbuild-linux-amd64 -o airbuild
+# Linux (x86_64)
+curl -L https://github.com/airbuild/cli/releases/latest/download/airbuild-linux-amd64 -o airbuild
 chmod +x airbuild && sudo mv airbuild /usr/local/bin/
+
+# Linux (ARM64)
+curl -L https://github.com/airbuild/cli/releases/latest/download/airbuild-linux-arm64 -o airbuild
+chmod +x airbuild && sudo mv airbuild /usr/local/bin/
+```
+
+```powershell
+# Windows (PowerShell)
+$dir = "$env:LOCALAPPDATA\AirBuild"
+New-Item -ItemType Directory -Path $dir -Force
+Invoke-WebRequest "https://github.com/airbuild/cli/releases/latest/download/airbuild-windows-amd64.exe" -OutFile "$dir\airbuild.exe"
+# Add to PATH:
+[Environment]::SetEnvironmentVariable("Path", "$env:Path;$dir", "User")
 ```
 
 ### From source
@@ -34,7 +59,8 @@ go install github.com/airbuild/cli@latest
 
 ```bash
 cd packages/cli
-make build
+make build      # current platform
+make dist       # all platforms
 ```
 
 ## Quick start
@@ -119,12 +145,15 @@ the upload command:
 ### GitHub Actions
 
 ```yaml
-- name: Upload to AirBuild
+- name: Install AirBuild CLI
   run: |
-    curl -L https://github.com/airbuild/airbuild/releases/latest/download/airbuild-linux-amd64 -o airbuild
-    chmod +x airbuild
-    ./airbuild config set --api-key ${{ secrets.AIRBUILD_API_KEY }}
-    ./airbuild upload ./build/app-release.apk --app-id ${{ secrets.AIRBUILD_APP_ID }}
+    curl -fsSL https://raw.githubusercontent.com/airbuild/cli/main/install.sh | bash
+
+- name: Login
+  run: airbuild login --api-key ${{ secrets.AIRBUILD_API_KEY }}
+
+- name: Upload build
+  run: airbuild upload ./app/build/outputs/apk/release/app-release.apk --app-id ${{ secrets.AIRBUILD_APP_ID }}
 ```
 
 ### GitLab CI
@@ -132,15 +161,23 @@ the upload command:
 ```yaml
 upload:
   script:
-    - curl -L https://github.com/airbuild/airbuild/releases/latest/download/airbuild-linux-amd64 -o airbuild
-    - chmod +x airbuild
-    - ./airbuild config set --api-key $AIRBUILD_API_KEY
-    - ./airbuild upload ./build/app-release.apk --app-id $AIRBUILD_APP_ID
+    - curl -fsSL https://raw.githubusercontent.com/airbuild/cli/main/install.sh | bash
+    - airbuild login --api-key $AIRBUILD_API_KEY
+    - airbuild upload ./app/build/outputs/apk/release/app-release.apk --app-id $AIRBUILD_APP_ID
+```
+
+### Azure Pipelines (Windows)
+
+```yaml
+- script: |
+    irm https://raw.githubusercontent.com/airbuild/cli/main/install.ps1 | iex
+    airbuild login --api-key $(AIRBUILD_API_KEY)
+    airbuild upload ./app/build/outputs/apk/release/app-release.apk --app-id $(AIRBUILD_APP_ID)
 ```
 
 ## Configuration
 
-Config is stored at `~/.airbuild/config.json`:
+Config is stored at `~/.airbuild/config.json` (on Windows: `%USERPROFILE%\.airbuild\config.json`):
 
 ```json
 {
@@ -150,6 +187,18 @@ Config is stored at `~/.airbuild/config.json`:
   "orgName": "My Org"
 }
 ```
+
+## Cross-platform support
+
+Pre-built binaries are available for:
+
+- **macOS** — Apple Silicon (`darwin-arm64`) and Intel (`darwin-amd64`)
+- **Linux** — x86_64 (`linux-amd64`) and ARM64 (`linux-arm64`)
+- **Windows** — x86_64 (`windows-amd64`) and ARM64 (`windows-arm64`)
+
+The CLI auto-enables ANSI colors on Windows 10+ (VT processing) and falls
+back to plain text on legacy terminals. Unicode symbols are rendered using
+UTF-8 code page on Windows.
 
 ## Cross-compilation
 
@@ -165,3 +214,18 @@ Produces binaries in `dist/`:
 - `airbuild-linux-amd64`
 - `airbuild-linux-arm64`
 - `airbuild-windows-amd64.exe`
+- `airbuild-windows-arm64.exe`
+
+## Releasing
+
+Releases are automated via GitHub Actions. To create a new release:
+
+```bash
+git tag cli-v1.0.0
+git push origin cli-v1.0.0
+```
+
+This triggers the [release workflow](.github/workflows/release.yml) which:
+1. Cross-compiles binaries for all 6 platforms
+2. Generates SHA-256 checksums
+3. Creates a GitHub Release with all binaries attached

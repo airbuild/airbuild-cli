@@ -1,0 +1,151 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "cli-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: windows
+            arch: amd64
+          - os: windows
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            # Strip "cli-" prefix from tag (cli-v1.0.0 → v1.0.0)
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "version=${TAG#cli-}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          go build -ldflags "-X main.version=${{ steps.version.outputs.version }}" \
+            -trimpath \
+            -o "dist/airbuild-${{ matrix.os }}-${{ matrix.arch }}${EXT}" .
+          echo "Built dist/airbuild-${{ matrix.os }}-${{ matrix.arch }}${EXT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airbuild-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/airbuild-${{ matrix.os }}-${{ matrix.arch }}*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=cli-${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "version=${TAG#cli-}" >> $GITHUB_OUTPUT
+            echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum airbuild-* > checksums.txt
+          cat checksums.txt
+
+      - name: List files
+        run: |
+          ls -lh dist/
+          echo "---"
+          cat dist/checksums.txt
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: AirBuild CLI ${{ steps.version.outputs.version }}
+          body: |
+            ## AirBuild CLI ${{ steps.version.outputs.version }}
+
+            ### Install
+
+            **macOS / Linux (one-liner):**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/airbuild/cli/main/install.sh | bash
+            ```
+
+            **Windows (PowerShell):**
+            ```powershell
+            irm https://raw.githubusercontent.com/airbuild/cli/main/install.ps1 | iex
+            ```
+
+            **Manual download:** Download the binary for your platform below, rename it to `airbuild` (or `airbuild.exe` on Windows), and add it to your PATH.
+
+            ### Verify checksum
+            ```bash
+            sha256sum airbuild-darwin-arm64
+            # compare with checksums.txt
+            ```
+
+            ### Binaries
+            | Platform | File |
+            |----------|------|
+            | macOS (Apple Silicon) | `airbuild-darwin-arm64` |
+            | macOS (Intel) | `airbuild-darwin-amd64` |
+            | Linux (x86_64) | `airbuild-linux-amd64` |
+            | Linux (ARM64) | `airbuild-linux-arm64` |
+            | Windows (x86_64) | `airbuild-windows-amd64.exe` |
+            | Windows (ARM64) | `airbuild-windows-arm64.exe` |
+          files: |
+            dist/airbuild-*
+            dist/checksums.txt
+          draft: false
+          prerelease: false
