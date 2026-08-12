@@ -69,20 +69,19 @@ make dist       # all platforms
 # 1. Log in with your API key (from Dashboard > Settings > API Keys)
 airbuild login --api-key airbuild_xxx
 
-# 2. List your apps
-airbuild apps list
+# 2. Initialize your project (creates .airbuild.json with build paths)
+airbuild init
 
-# 3. Upload a build
+# 3. Build your app, then push
+flutter build apk --release    # or your framework's build command
+airbuild push                  # uploads and prints the install link
+```
+
+### Direct upload (no project config needed)
+
+```bash
+# Upload a specific file to a specific app
 airbuild upload ./build/app-release.apk --app-id app_xxx
-
-# 4. List builds
-airbuild builds list --app-id app_xxx
-
-# 5. Create an install link
-airbuild links create --build-id build_xxx
-
-# 6. List install links
-airbuild links list --app-id app_xxx
 ```
 
 ## Commands
@@ -94,6 +93,59 @@ Authenticate with your AirBuild API key. Saves credentials to `~/.airbuild/confi
 airbuild login --api-key airbuild_xxx
 airbuild login --api-key airbuild_xxx --api-url https://staging.airbuild.dev
 ```
+
+### `airbuild init`
+Create a `.airbuild.json` config file for your project. Enables `airbuild push`.
+
+```bash
+airbuild init                    # Interactive setup
+airbuild init --app-id app_xxx   # Link an existing app
+```
+
+The interactive flow detects your framework (Flutter, React Native, Android
+native, iOS native) and suggests build output paths. You can accept or
+override them.
+
+The resulting `.airbuild.json`:
+
+```json
+{
+  "appId": "clxxxx...",
+  "builds": {
+    "android": {
+      "debug": "build/app/outputs/flutter-apk/app-debug.apk",
+      "release": "build/app/outputs/flutter-apk/app-release.apk"
+    },
+    "ios": {
+      "debug": "build/ios/ipa/app-debug.ipa",
+      "release": "build/ios/ipa/app-release.ipa"
+    }
+  }
+}
+```
+
+### `airbuild push`
+Upload a build using the `.airbuild.json` config file.
+
+```bash
+airbuild push                              # Push release (auto platform)
+airbuild push --platform android           # Push Android release
+airbuild push --platform ios --debug       # Push iOS debug
+airbuild push --all                        # Push both platforms
+airbuild push --release --expiry 30        # Push with 30-day link expiry
+airbuild push --json                       # JSON output for CI/CD
+airbuild push --release-notes "Bug fixes"  # Include release notes
+```
+
+| Flag              | Description                                        | Default  |
+| ----------------- | -------------------------------------------------- | -------- |
+| `--platform`      | `android` or `ios` (required if both configured)   | auto     |
+| `--release`       | Upload the release build                           | yes      |
+| `--debug`         | Upload the debug build                             | no       |
+| `--all`           | Upload all configured platforms                    | no       |
+| `--expiry`        | Install link expiry in days (0 = plan default)     | 0        |
+| `--json`          | Output results as JSON (for CI/CD)                | no       |
+| `--release-notes` | Release notes for this build                       | none     |
 
 ### `airbuild upload <file>`
 Upload an IPA or APK build. Platform is auto-detected from the file extension.
@@ -139,10 +191,26 @@ airbuild config set --api-url https://...     # Set API URL
 
 ## CI/CD integration
 
-The CLI is designed for CI/CD pipelines. Set the API key via config and run
-the upload command:
+The CLI is designed for CI/CD pipelines. With `airbuild init` + `airbuild push`,
+your pipeline just runs `airbuild push` — no file paths or app IDs to manage.
 
-### GitHub Actions
+### GitHub Actions (with init + push)
+
+```yaml
+- name: Install AirBuild CLI
+  run: curl -fsSL https://raw.githubusercontent.com/airbuild/cli/main/install.sh | bash
+
+- name: Login
+  run: airbuild login --api-key ${{ secrets.AIRBUILD_API_KEY }}
+
+- name: Build
+  run: flutter build apk --release
+
+- name: Push to AirBuild
+  run: airbuild push --json
+```
+
+### GitHub Actions (direct upload)
 
 ```yaml
 - name: Install AirBuild CLI
@@ -163,7 +231,7 @@ upload:
   script:
     - curl -fsSL https://raw.githubusercontent.com/airbuild/cli/main/install.sh | bash
     - airbuild login --api-key $AIRBUILD_API_KEY
-    - airbuild upload ./app/build/outputs/apk/release/app-release.apk --app-id $AIRBUILD_APP_ID
+    - airbuild push --json
 ```
 
 ### Azure Pipelines (Windows)
@@ -172,12 +240,14 @@ upload:
 - script: |
     irm https://raw.githubusercontent.com/airbuild/cli/main/install.ps1 | iex
     airbuild login --api-key $(AIRBUILD_API_KEY)
-    airbuild upload ./app/build/outputs/apk/release/app-release.apk --app-id $(AIRBUILD_APP_ID)
+    airbuild push --platform android --release
 ```
 
 ## Configuration
 
-Config is stored at `~/.airbuild/config.json` (on Windows: `%USERPROFILE%\.airbuild\config.json`):
+### CLI config (`~/.airbuild/config.json`)
+
+Stores your API key and organization info. Created by `airbuild login`.
 
 ```json
 {
@@ -185,6 +255,23 @@ Config is stored at `~/.airbuild/config.json` (on Windows: `%USERPROFILE%\.airbu
   "apiUrl": "https://airbuild.dev",
   "orgId": "xxx",
   "orgName": "My Org"
+}
+```
+
+### Project config (`.airbuild.json`)
+
+Stores the app ID and build output paths for the current project. Created by
+`airbuild init`. Used by `airbuild push`.
+
+```json
+{
+  "appId": "clxxxx...",
+  "builds": {
+    "android": {
+      "debug": "build/app/outputs/flutter-apk/app-debug.apk",
+      "release": "build/app/outputs/flutter-apk/app-release.apk"
+    }
+  }
 }
 ```
 

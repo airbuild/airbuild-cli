@@ -126,14 +126,15 @@ type VerifyResponse struct {
 
 // App represents an app in list responses.
 type App struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Platforms []string `json:"platforms"`
-	BundleID  string   `json:"bundleId"`
-	IconURL   string   `json:"iconUrl"`
-	CreatedAt string   `json:"createdAt"`
-	UpdatedAt string   `json:"updatedAt"`
-	Count     struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Platforms       []string `json:"platforms"`
+	IOSBundleID     string   `json:"iosBundleId"`
+	AndroidBundleID string   `json:"androidBundleId"`
+	IconURL         string   `json:"iconUrl"`
+	CreatedAt       string   `json:"createdAt"`
+	UpdatedAt       string   `json:"updatedAt"`
+	Count           struct {
 		Builds int `json:"builds"`
 	} `json:"_count"`
 }
@@ -173,12 +174,12 @@ type BuildsResponse struct {
 
 // LinkWithBuild is an install link with nested build info (for list view).
 type LinkWithBuild struct {
-	ID            string `json:"id"`
-	Slug          string `json:"slug"`
-	IsActive      bool   `json:"isActive"`
+	ID            string  `json:"id"`
+	Slug          string  `json:"slug"`
+	IsActive      bool    `json:"isActive"`
 	ExpiresAt     *string `json:"expiresAt"`
-	DownloadCount int    `json:"downloadCount"`
-	CreatedAt     string `json:"createdAt"`
+	DownloadCount int     `json:"downloadCount"`
+	CreatedAt     string  `json:"createdAt"`
 	Build         struct {
 		ID       string `json:"id"`
 		Version  string `json:"version"`
@@ -236,6 +237,24 @@ func (c *Client) Verify() (*VerifyResponse, error) {
 func (c *Client) ListApps() (*AppsResponse, error) {
 	var resp AppsResponse
 	if err := c.get("/api/cli/apps", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// CreateAppResponse is returned by POST /api/cli/apps.
+type CreateAppResponse struct {
+	App App `json:"app"`
+}
+
+// CreateApp creates a new app in the organization.
+func (c *Client) CreateApp(name string, platforms []string) (*CreateAppResponse, error) {
+	body := map[string]interface{}{
+		"name":      name,
+		"platforms": platforms,
+	}
+	var resp CreateAppResponse
+	if err := c.postJSON("/api/cli/apps", body, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

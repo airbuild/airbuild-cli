@@ -39,11 +39,19 @@ var appsListCmd = &cobra.Command{
 				}
 				platforms += p
 			}
+			bundleID := ""
+			if app.IOSBundleID != "" && app.AndroidBundleID != "" {
+				bundleID = "iOS: " + app.IOSBundleID + " | Android: " + app.AndroidBundleID
+			} else if app.IOSBundleID != "" {
+				bundleID = app.IOSBundleID
+			} else if app.AndroidBundleID != "" {
+				bundleID = app.AndroidBundleID
+			}
 			rows = append(rows, []string{
 				app.ID,
 				app.Name,
 				platforms,
-				app.BundleID,
+				bundleID,
 				formatCount(app.Count.Builds),
 			})
 		}

@@ -15,10 +15,12 @@ var rootCmd = &cobra.Command{
 	Long: `AirBuild CLI is a command-line tool for uploading iOS/Android builds
 to AirBuild and managing your apps, builds, and install links.
 
-Authenticate first with:
+Quick start:
   airbuild login --api-key airbuild_xxx
+  airbuild init                    # Set up project config (.airbuild.json)
+  airbuild push                    # Upload build using project config
 
-Then upload a build:
+Or upload a file directly:
   airbuild upload ./app-release.apk --app-id app_xxx`,
 	SilenceUsage: true,
 }
