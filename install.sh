@@ -3,11 +3,11 @@
 # AirBuild CLI installer — macOS and Linux
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/airbuild/cli/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/airbuild/airbuild-cli/main/install.sh | bash
 #
 set -euo pipefail
 
-REPO="airbuild/cli"
+REPO="airbuild/airbuild-cli"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
 
 # Colors
@@ -71,14 +71,14 @@ info "Downloading ${BINARY}..."
 if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMPFILE"; then
   err "Download failed. Please check your internet connection."
   err "If no release exists yet, build from source:"
-  err "  go install github.com/airbuild/cli@latest"
+  err "  go install github.com/airbuild/airbuild-cli@latest"
   exit 1
 fi
 
 # --- Verify it's a binary (not an HTML error page) ---
 if file "$TMPFILE" | grep -q "HTML\|ASCII text"; then
   err "Downloaded file is not a binary — the release may not exist yet."
-  err "Build from source instead: go install github.com/airbuild/cli@latest"
+  err "Build from source instead: go install github.com/airbuild/airbuild-cli@latest"
   exit 1
 fi
 

@@ -1,17 +1,17 @@
 # AirBuild CLI installer — Windows (PowerShell)
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/airbuild/cli/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/airbuild/airbuild-cli/main/install.ps1 | iex
 #
 # Or with a specific version:
-#   $env:AIRBUILD_VERSION = "v1.0.0"; irm https://raw.githubusercontent.com/airbuild/cli/main/install.ps1 | iex
+#   $env:AIRBUILD_VERSION = "v1.0.0"; irm https://raw.githubusercontent.com/airbuild/airbuild-cli/main/install.ps1 | iex
 #
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "airbuild/cli"
+$Repo = "airbuild/airbuild-cli"
 
 # --- Detect platform ---
 $Os = "windows"
@@ -46,7 +46,7 @@ try {
 } catch {
     Write-Host "Download failed: $_" -ForegroundColor Red
     Write-Host "If no release exists yet, build from source:" -ForegroundColor Red
-    Write-Host "  go install github.com/airbuild/cli@latest" -ForegroundColor Red
+    Write-Host "  go install github.com/airbuild/airbuild-cli@latest" -ForegroundColor Red
     exit 1
 }
 
