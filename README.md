@@ -189,6 +189,25 @@ airbuild config set --api-key airbuild_xxx    # Set API key
 airbuild config set --api-url https://...     # Set API URL
 ```
 
+### `airbuild version`
+Print the current CLI version and platform info.
+
+```bash
+airbuild version
+```
+
+### `airbuild upgrade`
+Check for a newer version and upgrade the CLI in place.
+
+```bash
+airbuild upgrade           # Upgrade to the latest version
+airbuild upgrade --check   # Only check if an update is available
+```
+
+The command queries the GitHub Releases API, downloads the correct binary
+for your OS and architecture, and atomically replaces the running binary.
+No manual download or PATH changes needed.
+
 ## CI/CD integration
 
 The CLI is designed for CI/CD pipelines. With `airbuild init` + `airbuild push`,

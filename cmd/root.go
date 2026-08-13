@@ -8,6 +8,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// cliVersion holds the current CLI version, set by main.go from build-time ldflags.
+var cliVersion = "dev"
+
+// SetVersion is called by main() to inject the build-time version.
+func SetVersion(v string) {
+	cliVersion = v
+	rootCmd.Version = v
+}
+
 // rootCmd is the entry point for the AirBuild CLI.
 var rootCmd = &cobra.Command{
 	Use:   "airbuild",
@@ -23,6 +32,7 @@ Quick start:
 Or upload a file directly:
   airbuild upload ./app-release.apk --app-id app_xxx`,
 	SilenceUsage: true,
+	Version:      cliVersion,
 }
 
 // Execute runs the root command.
