@@ -69,7 +69,11 @@ Examples:
 			p := strings.ToLower(pushPlatform)
 			if !projCfg.HasPlatform(p) {
 				ui.Error("Platform '%s' is not configured in .airbuild.json", p)
-				ui.Info("Configured platforms: %s", strings.Join(configuredPlatforms, ", "))
+				if len(configuredPlatforms) > 0 {
+					ui.Info("Configured platforms: %s", strings.Join(configuredPlatforms, ", "))
+				} else {
+					ui.Info("No platforms found in config. Check your .airbuild.json — the 'builds' key may be missing or empty.")
+				}
 				return
 			}
 			platformsToPush = []string{p}
@@ -117,16 +121,16 @@ Examples:
 }
 
 type pushResult struct {
-	Platform  string `json:"platform"`
-	BuildType string `json:"buildType"`
-	FilePath  string `json:"filePath"`
-	Success   bool   `json:"success"`
-	Error     string `json:"error,omitempty"`
-	BuildID   string `json:"buildId,omitempty"`
-	Version   string `json:"version,omitempty"`
-	Slug      string `json:"slug,omitempty"`
+	Platform   string `json:"platform"`
+	BuildType  string `json:"buildType"`
+	FilePath   string `json:"filePath"`
+	Success    bool   `json:"success"`
+	Error      string `json:"error,omitempty"`
+	BuildID    string `json:"buildId,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Slug       string `json:"slug,omitempty"`
 	InstallURL string `json:"installUrl,omitempty"`
-	Expiry    string `json:"expiry,omitempty"`
+	Expiry     string `json:"expiry,omitempty"`
 }
 
 func pushSingle(client *api.Client, projCfg *project.ProjectConfig, platform, buildType, baseURL string) pushResult {

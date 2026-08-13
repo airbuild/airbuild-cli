@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ConfigFile is the name of the project-level config file.
@@ -46,6 +47,16 @@ func LoadFrom(path string) (*ProjectConfig, error) {
 	if cfg.AppID == "" {
 		return nil, fmt.Errorf("invalid config: appId is missing")
 	}
+	// Ensure Builds map is initialized (handles "builds": null in JSON)
+	if cfg.Builds == nil {
+		cfg.Builds = make(map[string]PlatformBuilds)
+	}
+	// Normalize platform keys to lowercase (handles "Android" vs "android")
+	normalized := make(map[string]PlatformBuilds)
+	for k, v := range cfg.Builds {
+		normalized[strings.ToLower(k)] = v
+	}
+	cfg.Builds = normalized
 	return &cfg, nil
 }
 
