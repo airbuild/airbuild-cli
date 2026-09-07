@@ -208,6 +208,211 @@ The command queries the GitHub Releases API, downloads the correct binary
 for your OS and architecture, and atomically replaces the running binary.
 No manual download or PATH changes needed.
 
+## CodePush / OTA updates
+
+Push code-only updates to your apps without a store re-submission. AirBuild
+CodePush supports **Flutter** (via Shorebird's updater) and **React Native**
+(via the Expo Updates protocol) with independent feature flags, channels,
+staged rollout, and instant rollback.
+
+> **Feature flag:** CodePush must be enabled for your organization by an
+> admin (Admin → Feature Flags → `codepush_flutter` / `codepush_react_native`).
+> All CodePush endpoints return `403` when the flag is disabled.
+
+### Flutter CodePush
+
+Wraps the [Shorebird CLI](https://pub.dev/packages/shorebird_cli) — install
+it first with `dart pub global activate shorebird_cli`.
+
+#### `airbuild codepush flutter release`
+
+Register a Flutter release (runs `shorebird release`, then uploads the artifact).
+
+```bash
+airbuild codepush flutter release android \
+  --app app_xxx \
+  --version 1.0.0+1 \
+  --channel production
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+| `--version` | yes | — | App version, e.g. `1.0.0+1` |
+| `--architecture` | no | auto | Target architecture, e.g. `arm64-v8a` |
+| `--channel` | no | `production` | Distribution channel |
+| `--flutter-revision` | no | — | Flutter SDK version used |
+| `--shorebird-app-id` | no | — | Shorebird app_id |
+| `--release-notes` | no | — | Release notes |
+| `--artifact` | no | auto-detect | Path to libapp.so (skips build) |
+| `--skip-build` | no | `false` | Don't run `shorebird release` |
+
+#### `airbuild codepush flutter patch`
+
+Create a Flutter patch (runs `shorebird patch`, then uploads the diff).
+
+```bash
+shorebird patch android --no-confirm
+airbuild codepush flutter patch android \
+  --app app_xxx \
+  --release-version 1.0.0+1 \
+  --artifact path/to/patch.diff \
+  --release-notes "Fixed login crash"
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+| `--release-version` | yes | — | Release version this patch targets |
+| `--architecture` | no | — | Target architecture |
+| `--channel` | no | `production` | Distribution channel |
+| `--release-notes` | no | — | Patch notes |
+| `--artifact` | yes | — | Path to the patch diff file |
+| `--skip-build` | no | `false` | Don't run `shorebird patch` |
+
+#### `airbuild codepush flutter promote`
+
+Promote a patch to a channel at a rollout percentage.
+
+```bash
+airbuild codepush flutter promote \
+  --app app_xxx \
+  --patch 1 \
+  --channel production \
+  --rollout 25
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+| `--update-id` | no | — | Update ID (alternative to patch number) |
+| `--release-version` | no | — | Release version (with `--platform` + `--patch`) |
+| `--platform` | no | — | `ANDROID` or `IOS` |
+| `--patch` | no | — | Patch number (from `status`) |
+| `--channel` | no | `production` | Channel to promote to |
+| `--rollout` | no | `100` | Rollout percentage (0–100) |
+
+#### `airbuild codepush flutter rollback`
+
+Rollback a patch — devices revert on next check-in.
+
+```bash
+airbuild codepush flutter rollback --app app_xxx --patch 1
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+| `--update-id` | no | — | Update ID (alternative to patch number) |
+| `--release-version` | no | — | Release version |
+| `--platform` | no | — | `ANDROID` or `IOS` |
+| `--patch` | no | — | Patch number |
+| `--channel` | no | `production` | Channel |
+
+#### `airbuild codepush flutter status`
+
+Show all releases and patches for an app.
+
+```bash
+airbuild codepush flutter status --app app_xxx
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+
+### React Native CodePush
+
+Uses the [Expo Updates v1 protocol](https://docs.expo.dev/technical-specs/expo-updates-1/).
+Requires `expo-updates` in your app and `npx` on your PATH.
+
+#### `airbuild codepush react-native publish`
+
+Publish an update (runs `npx expo export`, then uploads bundle + assets).
+
+```bash
+airbuild codepush react-native publish \
+  --app app_xxx \
+  --platform android \
+  --runtime-version 1.0.0 \
+  --release-notes "Fixed navigation bug"
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+| `--platform` | yes | — | `android` or `ios` |
+| `--runtime-version` | yes | — | Must match `expo.updates.runtimeVersion` |
+| `--channel` | no | `production` | Distribution channel |
+| `--release-notes` | no | — | Release notes |
+| `--output-dir` | no | `dist` | Export directory |
+| `--skip-export` | no | `false` | Don't run `expo export` — read `--output-dir` |
+
+#### `airbuild codepush react-native promote`
+
+Promote an update to a channel at a rollout percentage.
+
+```bash
+airbuild codepush react-native promote \
+  --app app_xxx \
+  --update-id update_xxx \
+  --channel production \
+  --rollout 25
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+| `--update-id` | no | — | Update ID (alternative to `--platform` + `--runtime-version`) |
+| `--platform` | no | — | `ANDROID` or `IOS` |
+| `--runtime-version` | no | — | Runtime version |
+| `--channel` | no | `production` | Channel to promote to |
+| `--rollout` | no | `100` | Rollout percentage (0–100) |
+
+#### `airbuild codepush react-native rollback`
+
+Rollback an update — devices revert on next check-in.
+
+```bash
+airbuild codepush react-native rollback --app app_xxx --update-id update_xxx
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+| `--update-id` | yes | — | Update ID |
+
+#### `airbuild codepush react-native status`
+
+Show all releases and updates for an app.
+
+```bash
+airbuild codepush react-native status --app app_xxx
+```
+
+| Flag | Required | Default | Description |
+| ---- | -------- | ------- | ----------- |
+| `--app` | yes | — | App ID |
+
+### Typical workflow
+
+```bash
+# Flutter
+airbuild codepush flutter release android --app app_xxx --version 1.0.0+1
+# ...fix a Dart bug...
+airbuild codepush flutter patch android --app app_xxx --release-version 1.0.0+1 --artifact patch.diff
+airbuild codepush flutter promote --app app_xxx --patch 1 --channel production --rollout 25
+airbuild codepush flutter rollback --app app_xxx --patch 1
+
+# React Native
+airbuild codepush react-native publish --app app_xxx --platform android --runtime-version 1.0.0
+airbuild codepush react-native promote --app app_xxx --update-id update_xxx --rollout 25
+airbuild codepush react-native rollback --app app_xxx --update-id update_xxx
+```
+
+See the [CodePush documentation](https://docs.airbuild.dev/guides/codepush/) for
+setup instructions, device-side configuration, and CI/CD examples.
+
 ## CI/CD integration
 
 The CLI is designed for CI/CD pipelines. With `airbuild init` + `airbuild push`,
