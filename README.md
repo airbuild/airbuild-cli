@@ -215,6 +215,11 @@ CodePush supports **Flutter** (via Shorebird's updater) and **React Native**
 (via the Expo Updates protocol) with independent feature flags, channels,
 staged rollout, and instant rollback.
 
+> **Prerequisite:** Run `airbuild init` first. It creates `.airbuild.json`
+> in your project root, linking your app so you don't need `--app` on every
+> codepush command. All commands below assume this has been done — `--app`
+> is shown as optional in the flag tables.
+
 > **Feature flag:** CodePush must be enabled for your organization by an
 > admin (Admin → Feature Flags → `codepush_flutter` / `codepush_react_native`).
 > All CodePush endpoints return `403` when the flag is disabled.
@@ -229,15 +234,12 @@ it first with `dart pub global activate shorebird_cli`.
 Register a Flutter release (runs `shorebird release`, then uploads the artifact).
 
 ```bash
-airbuild codepush flutter release android \
-  --app app_xxx \
-  --version 1.0.0+1 \
-  --channel production
+airbuild codepush flutter release android --version 1.0.0+1
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID (read from config if omitted) |
 | `--version` | yes | — | App version, e.g. `1.0.0+1` |
 | `--architecture` | no | auto | Target architecture, e.g. `arm64-v8a` |
 | `--channel` | no | `production` | Distribution channel |
@@ -249,42 +251,62 @@ airbuild codepush flutter release android \
 
 #### `airbuild codepush flutter patch`
 
-Create a Flutter patch (runs `shorebird patch`, then uploads the diff).
+Create a Flutter patch. Without `--artifact`, the CLI auto-diffs against
+the release:
 
 ```bash
-shorebird patch android --no-confirm
-airbuild codepush flutter patch android \
-  --app app_xxx \
-  --release-version 1.0.0+1 \
-  --artifact path/to/patch.diff \
-  --release-notes "Fixed login crash"
+# Auto-diff (Android — full flow, no --artifact needed):
+airbuild codepush flutter patch android --release-version 1.0.0+1
+
+# Auto-diff (iOS — best-effort temp-dir scan, see limitations):
+airbuild codepush flutter patch ios --release-version 1.0.0+1
+
+# Manual diff (custom CI, or when auto-diff can't locate the artifact):
+shorebird patch ios
+airbuild codepush flutter patch ios --release-version 1.0.0+1 --artifact patch.diff
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID (read from config if omitted) |
 | `--release-version` | yes | — | Release version this patch targets |
 | `--architecture` | no | — | Target architecture |
 | `--channel` | no | `production` | Distribution channel |
 | `--release-notes` | no | — | Patch notes |
-| `--artifact` | yes | — | Path to the patch diff file |
-| `--skip-build` | no | `false` | Don't run `shorebird patch` |
+| `--artifact` | no | auto-diff | Path to a pre-built diff (skips auto-diff) |
+| `--skip-build` | no | `false` | Don't run `shorebird patch` — use existing build or `--artifact` |
+
+**Android auto-diff flow** (when `--artifact` is omitted):
+
+1. Runs `shorebird patch android --dry-run` (builds `libapp.so`, doesn't upload to Shorebird)
+2. Locates the freshly built `libapp.so` in Flutter's Gradle output
+3. Downloads the release's original `libapp.so` from AirBuild
+4. Uses Shorebird's cached `patch` binary (`~/.shorebird/bin/cache/artifacts/patch/patch`) to create the bidiff+zstd diff
+5. Uploads the diff to AirBuild
+
+**iOS auto-diff flow** (Phase 1 — best-effort, when `--artifact` is omitted):
+
+1. Records the current timestamp
+2. Runs `shorebird patch ios --dry-run` (builds + creates the diff in a random temp dir, doesn't upload to Shorebird)
+3. Scans the OS temp directory for a `diff.patch` file modified after the build started
+4. Uploads the located diff to AirBuild
+
+If the iOS temp-dir scan fails (aggressive temp cleanup, concurrent
+builds), fall back to `--artifact`. A future Phase 2 will drive Shorebird's
+`aot_tools` + `analyze_snapshot` + `patch` binaries directly to remove
+this limitation — see `docs/CHECKLIST.md` §5.2d.
 
 #### `airbuild codepush flutter promote`
 
 Promote a patch to a channel at a rollout percentage.
 
 ```bash
-airbuild codepush flutter promote \
-  --app app_xxx \
-  --patch 1 \
-  --channel production \
-  --rollout 25
+airbuild codepush flutter promote --patch 1 --channel production --rollout 25
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID |
 | `--update-id` | no | — | Update ID (alternative to patch number) |
 | `--release-version` | no | — | Release version (with `--platform` + `--patch`) |
 | `--platform` | no | — | `ANDROID` or `IOS` |
@@ -297,12 +319,12 @@ airbuild codepush flutter promote \
 Rollback a patch — devices revert on next check-in.
 
 ```bash
-airbuild codepush flutter rollback --app app_xxx --patch 1
+airbuild codepush flutter rollback --patch 1
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID |
 | `--update-id` | no | — | Update ID (alternative to patch number) |
 | `--release-version` | no | — | Release version |
 | `--platform` | no | — | `ANDROID` or `IOS` |
@@ -314,12 +336,12 @@ airbuild codepush flutter rollback --app app_xxx --patch 1
 Show all releases and patches for an app.
 
 ```bash
-airbuild codepush flutter status --app app_xxx
+airbuild codepush flutter status
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID |
 
 ### React Native CodePush
 
@@ -331,16 +353,12 @@ Requires `expo-updates` in your app and `npx` on your PATH.
 Publish an update (runs `npx expo export`, then uploads bundle + assets).
 
 ```bash
-airbuild codepush react-native publish \
-  --app app_xxx \
-  --platform android \
-  --runtime-version 1.0.0 \
-  --release-notes "Fixed navigation bug"
+airbuild codepush react-native publish --platform android --runtime-version 1.0.0
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID |
 | `--platform` | yes | — | `android` or `ios` |
 | `--runtime-version` | yes | — | Must match `expo.updates.runtimeVersion` |
 | `--channel` | no | `production` | Distribution channel |
@@ -353,16 +371,12 @@ airbuild codepush react-native publish \
 Promote an update to a channel at a rollout percentage.
 
 ```bash
-airbuild codepush react-native promote \
-  --app app_xxx \
-  --update-id update_xxx \
-  --channel production \
-  --rollout 25
+airbuild codepush react-native promote --update-id update_xxx --channel production --rollout 25
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID |
 | `--update-id` | no | — | Update ID (alternative to `--platform` + `--runtime-version`) |
 | `--platform` | no | — | `ANDROID` or `IOS` |
 | `--runtime-version` | no | — | Runtime version |
@@ -374,12 +388,12 @@ airbuild codepush react-native promote \
 Rollback an update — devices revert on next check-in.
 
 ```bash
-airbuild codepush react-native rollback --app app_xxx --update-id update_xxx
+airbuild codepush react-native rollback --update-id update_xxx
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID |
 | `--update-id` | yes | — | Update ID |
 
 #### `airbuild codepush react-native status`
@@ -387,27 +401,55 @@ airbuild codepush react-native rollback --app app_xxx --update-id update_xxx
 Show all releases and updates for an app.
 
 ```bash
-airbuild codepush react-native status --app app_xxx
+airbuild codepush react-native status
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
-| `--app` | yes | — | App ID |
+| `--app` | no | `.airbuild.json` | App ID |
+
+### CodePush limitations
+
+- **iOS auto-diff is best-effort (Phase 1).** The CLI runs
+  `shorebird patch ios --dry-run` and scans the OS temp directory for the
+  resulting `diff.patch`. Shorebird writes the diff to a random temp
+  directory, so the scan can fail if temp files are cleaned aggressively or
+  another build runs concurrently. If the scan fails, pass `--artifact`
+  explicitly. Phase 2 (full iOS auto-diff via `aot_tools` +
+  `analyze_snapshot` + `patch` binaries) is tracked in
+  `docs/CHECKLIST.md` §5.2d.
+- **Multi-architecture releases store one `storageKey`.** When you upload
+  multiple architectures for the same release (e.g. `arm64-v8a` +
+  `armeabi-v7a`), only the last-uploaded architecture's storage key is
+  retained. For multi-arch setups, either upload one architecture per
+  release or use `--artifact` to diff against a specific arch.
+- **Android auto-diff depends on Shorebird's cached `patch` binary.** The
+  auto-diff flow uses Shorebird's `patch` binary at
+  `~/.shorebird/bin/cache/artifacts/patch/patch`. If a future Shorebird
+  release moves it, the CLI falls back to a clear error asking you to pass
+  `--artifact` manually.
+- **Patches are Dart-only (Flutter).** Native code changes and asset
+  changes cannot be patched — you need a new release for those.
+- **One release per version + channel.** Re-registering the same version
+  on the same channel appends architectures to the existing release
+  rather than creating a new one.
 
 ### Typical workflow
 
 ```bash
-# Flutter
-airbuild codepush flutter release android --app app_xxx --version 1.0.0+1
+# --- Flutter ---
+airbuild init                                         # one-time: link app
+airbuild codepush flutter release android --version 1.0.0+1
 # ...fix a Dart bug...
-airbuild codepush flutter patch android --app app_xxx --release-version 1.0.0+1 --artifact patch.diff
-airbuild codepush flutter promote --app app_xxx --patch 1 --channel production --rollout 25
-airbuild codepush flutter rollback --app app_xxx --patch 1
+airbuild codepush flutter patch android --release-version 1.0.0+1
+airbuild codepush flutter promote --patch 1 --channel production --rollout 25
+airbuild codepush flutter rollback --patch 1
 
-# React Native
-airbuild codepush react-native publish --app app_xxx --platform android --runtime-version 1.0.0
-airbuild codepush react-native promote --app app_xxx --update-id update_xxx --rollout 25
-airbuild codepush react-native rollback --app app_xxx --update-id update_xxx
+# --- React Native ---
+airbuild init                                         # one-time: link app
+airbuild codepush react-native publish --platform android --runtime-version 1.0.0
+airbuild codepush react-native promote --update-id update_xxx --rollout 25
+airbuild codepush react-native rollback --update-id update_xxx
 ```
 
 See the [CodePush documentation](https://docs.airbuild.dev/guides/codepush/) for

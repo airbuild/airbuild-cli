@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -669,6 +670,61 @@ func (c *Client) CodePushFlutterStatus(appID string) (*CodePushStatusResponse, e
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// CodePushReleaseDownloadResponse is returned by GET /api/codepush/flutter/release/download.
+type CodePushReleaseDownloadResponse struct {
+	DownloadUrl string `json:"downloadUrl"`
+	Release     struct {
+		ID            string   `json:"id"`
+		Version       string   `json:"version"`
+		Platform      string   `json:"platform"`
+		Architectures []string `json:"architectures"`
+	} `json:"release"`
+}
+
+// CodePushFlutterReleaseDownload fetches a signed URL for the release's
+// original libapp.so (the AOT snapshot that patches are diffed against).
+// The CLI uses this in the auto-diff flow to download the release artifact
+// locally, then creates the binary diff using Shorebird's patch binary.
+func (c *Client) CodePushFlutterReleaseDownload(appID, releaseVersion, platform, architecture, channel string) (*CodePushReleaseDownloadResponse, error) {
+	params := url.Values{}
+	params.Set("appId", appID)
+	params.Set("releaseVersion", releaseVersion)
+	params.Set("platform", platform)
+	if architecture != "" {
+		params.Set("architecture", architecture)
+	}
+	if channel != "" {
+		params.Set("channel", channel)
+	}
+	var resp CodePushReleaseDownloadResponse
+	if err := c.get("/api/codepush/flutter/release/download?"+params.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DownloadFile downloads a URL to a local file, returning the file path.
+// Used to fetch release artifacts from signed storage URLs.
+func (c *Client) DownloadFile(fileURL, destPath string) error {
+	resp, err := c.HTTP.Get(fileURL)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("download failed (HTTP %d)", resp.StatusCode)
+	}
+	out, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("could not create file: %w", err)
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("could not write file: %w", err)
+	}
+	return nil
 }
 
 // Upload uploads a build file (IPA/APK) to a specific app.

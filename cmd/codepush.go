@@ -3,10 +3,13 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/airbuild/cli/internal/api"
 	"github.com/airbuild/cli/internal/expo"
+	"github.com/airbuild/cli/internal/project"
 	"github.com/airbuild/cli/internal/shorebird"
 	"github.com/airbuild/cli/internal/ui"
 	"github.com/spf13/cobra"
@@ -32,10 +35,12 @@ build + binary diff is still produced locally by the Shorebird CLI
 (https://pub.dev/packages/shorebird_cli — "dart pub global activate shorebird_cli").
 
 Typical flow:
-  airbuild codepush flutter release android --app app_xxx --version 1.0.0+1
+  airbuild codepush flutter release android --version 1.0.0+1
   # ...fix a Dart bug...
-  airbuild codepush flutter patch android --app app_xxx --release-version 1.0.0+1
-  airbuild codepush flutter promote --app app_xxx --patch 1 --channel production --rollout 25`,
+  airbuild codepush flutter patch android --release-version 1.0.0+1 --artifact patch.diff
+  airbuild codepush flutter promote --patch 1 --channel production --rollout 25
+
+(If you've run ` + "`airbuild init`" + `, --app is read from .airbuild.json automatically.)`,
 }
 
 // codepushReactNativeCmd groups the React Native subcommands, which wrap
@@ -52,8 +57,10 @@ both Expo-managed and bare React Native apps.
 The bundle itself is produced locally by the Expo CLI ("npx expo export").
 
 Typical flow:
-  airbuild codepush react-native publish --app app_xxx --runtime-version 1.0.0
-  airbuild codepush react-native promote --app app_xxx --platform android --runtime-version 1.0.0 --channel production --rollout 25`,
+  airbuild codepush react-native publish --runtime-version 1.0.0
+  airbuild codepush react-native promote --platform android --runtime-version 1.0.0 --channel production --rollout 25
+
+(If you've run ` + "`airbuild init`" + `, --app is read from .airbuild.json automatically.)`,
 }
 
 func init() {
@@ -88,8 +95,13 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 			return
 		}
 
-		if cpReleaseAppID == "" || cpReleaseVersion == "" {
-			ui.Error("--app and --version are required")
+		var ok bool
+		cpReleaseAppID, ok = resolveAppID(cpReleaseAppID)
+		if !ok {
+			return
+		}
+		if cpReleaseVersion == "" {
+			ui.Error("--version is required")
 			return
 		}
 
@@ -150,7 +162,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 }
 
 func init() {
-	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseAppID, "app", "", "App ID (required)")
+	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseVersion, "version", "", "App version, e.g. 1.0.0+1 (required)")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseArchitecture, "architecture", "", "Target architecture, e.g. arm64-v8a (Android)")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseChannel, "channel", "production", "Distribution channel")
@@ -176,7 +188,7 @@ var (
 
 var codepushFlutterPatchCmd = &cobra.Command{
 	Use:   "patch <android|ios>",
-	Short: "Create a Flutter patch (runs `shorebird patch`, then uploads the diff)",
+	Short: "Create a Flutter patch (auto-diffs against the release, then uploads)",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		platformArg := strings.ToLower(args[0])
@@ -186,29 +198,80 @@ var codepushFlutterPatchCmd = &cobra.Command{
 			return
 		}
 
-		if cpPatchAppID == "" || cpPatchReleaseVersion == "" {
-			ui.Error("--app and --release-version are required")
+		var ok bool
+		cpPatchAppID, ok = resolveAppID(cpPatchAppID)
+		if !ok {
 			return
 		}
-		if cpPatchArtifact == "" {
-			ui.Error(`--artifact <path to .patch/diff file> is required.
+		if cpPatchReleaseVersion == "" {
+			ui.Error("--release-version is required")
+			return
+		}
 
-Shorebird's "patch" command doesn't leave a stable, documented local file
-behind once it finishes (it talks to Shorebird's own servers directly) — so
-unlike "release", this wrapper can't reliably auto-locate the diff. Run
-"shorebird patch %s" yourself first, then pass the resulting artifact via
---artifact. See docs/flutter-codepush.md for the current recommended flow.`, platformArg)
-			return
-		}
-		if !cpPatchSkipBuild && shorebird.IsInstalled() {
-			ui.Info("Running `shorebird patch %s` (for its build/diff side effects)...", platformArg)
-			if err := shorebird.Run(".", "patch", platformArg, "--no-confirm"); err != nil {
-				ui.Warn("shorebird patch reported an error (continuing with --artifact anyway): %v", err)
+		artifact := cpPatchArtifact
+
+		if artifact == "" {
+			// --- Auto-diff flow ---
+			// When --artifact is omitted, the CLI builds the patch and
+			// locates the resulting diff automatically.
+			//
+			// Android (Phase 2 — full auto-diff):
+			//   1. Run `shorebird patch android --dry-run` (builds libapp.so)
+			//   2. Locate the freshly built libapp.so via FindAndroidLibapp
+			//   3. Download the release's original libapp.so from AirBuild
+			//   4. Use Shorebird's cached `patch` binary to create the diff
+			//   5. Upload the diff to AirBuild
+			//
+			// iOS (Phase 1 — temp dir scan):
+			//   1. Record the current timestamp
+			//   2. Run `shorebird patch ios --dry-run` (builds + creates diff
+			//      in a random temp dir, but doesn't upload to Shorebird)
+			//   3. Scan the OS temp dir for a recently-created diff.patch
+			//   4. Upload the located diff to AirBuild
+			//
+			// iOS Phase 1 is best-effort: Shorebird creates the diff in a
+			// random temp directory, so we locate it by scanning for files
+			// named "diff.patch" modified after the build started. If the
+			// scan fails (temp cleanup, concurrent builds), the user falls
+			// back to --artifact.
+
+			if !shorebird.IsInstalled() {
+				ui.Error("shorebird CLI not found on PATH. Install it with `dart pub global activate shorebird_cli`, or pass --artifact to skip the build step.")
+				return
+			}
+
+			if platform == "ANDROID" {
+				artifact, err = runAndroidAutoDiff(platformArg, cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchArchitecture, cpPatchChannel, cpPatchAppID)
+				if err != nil {
+					ui.Error("%v", err)
+					return
+				}
+			} else {
+				// iOS — Phase 1: temp dir scan.
+				artifact, err = runIOSAutoDiff(platformArg, cpPatchReleaseVersion, cpPatchSkipBuild)
+				if err != nil {
+					ui.Error(`%v
+
+Could not auto-locate the iOS patch diff. You can still create a patch
+manually:
+  1. Run "shorebird patch ios" yourself
+  2. Locate the resulting diff.patch file
+  3. Pass it via --artifact`, err)
+					return
+				}
+			}
+		} else {
+			// --- Explicit --artifact flow (original behavior) ---
+			if !cpPatchSkipBuild && shorebird.IsInstalled() {
+				ui.Info("Running `shorebird patch %s` (for its build/diff side effects)...", platformArg)
+				if err := shorebird.Run(".", "patch", platformArg, "--no-confirm"); err != nil {
+					ui.Warn("shorebird patch reported an error (continuing with --artifact anyway): %v", err)
+				}
 			}
 		}
 
-		if _, err := os.Stat(cpPatchArtifact); err != nil {
-			ui.Error("Artifact not found: %s", cpPatchArtifact)
+		if _, err := os.Stat(artifact); err != nil {
+			ui.Error("Artifact not found: %s", artifact)
 			return
 		}
 
@@ -217,7 +280,7 @@ unlike "release", this wrapper can't reliably auto-locate the diff. Run
 
 		ui.Info("Uploading patch...")
 		resp, err := client.CodePushFlutterPatch(
-			cpPatchArtifact, cpPatchAppID, platform, cpPatchReleaseVersion, cpPatchArchitecture, cpPatchChannel, cpPatchNotes,
+			artifact, cpPatchAppID, platform, cpPatchReleaseVersion, cpPatchArchitecture, cpPatchChannel, cpPatchNotes,
 		)
 		if err != nil {
 			ui.Error("Failed to create patch: %v", err)
@@ -225,19 +288,19 @@ unlike "release", this wrapper can't reliably auto-locate the diff. Run
 		}
 
 		ui.Success("Patch #%d created (DRAFT, 0%% rollout)", resp.Update.PatchNumber)
-		ui.Info("Promote it with: airbuild codepush flutter promote --app %s --patch %d --channel %s --rollout 25",
-			cpPatchAppID, resp.Update.PatchNumber, valueOr(cpPatchChannel, "production"))
+		ui.Info("Promote it with: airbuild codepush flutter promote --patch %d --channel %s --rollout 25",
+			resp.Update.PatchNumber, valueOr(cpPatchChannel, "production"))
 	},
 }
 
 func init() {
-	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchAppID, "app", "", "App ID (required)")
+	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchReleaseVersion, "release-version", "", "The release version this patch targets, e.g. 1.0.0+1 (required)")
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchArchitecture, "architecture", "", "Target architecture, e.g. arm64-v8a (Android)")
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchChannel, "channel", "production", "Distribution channel")
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchNotes, "release-notes", "", "Patch notes")
-	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchArtifact, "artifact", "", "Path to the patch diff file to upload (required)")
-	codepushFlutterPatchCmd.Flags().BoolVar(&cpPatchSkipBuild, "skip-build", false, "Don't run `shorebird patch` at all — just upload --artifact")
+	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchArtifact, "artifact", "", "Path to a pre-built patch diff file (optional — auto-diffs if omitted)")
+	codepushFlutterPatchCmd.Flags().BoolVar(&cpPatchSkipBuild, "skip-build", false, "Don't run `shorebird patch` — use existing build output or --artifact")
 	codepushFlutterCmd.AddCommand(codepushFlutterPatchCmd)
 }
 
@@ -257,8 +320,9 @@ var codepushFlutterPromoteCmd = &cobra.Command{
 	Use:   "promote",
 	Short: "Promote a Flutter patch to a channel at a rollout percentage",
 	Run: func(cmd *cobra.Command, args []string) {
-		if cpPromoteAppID == "" {
-			ui.Error("--app is required")
+		var ok bool
+		cpPromoteAppID, ok = resolveAppID(cpPromoteAppID)
+		if !ok {
 			return
 		}
 		if cpPromoteUpdateID == "" && (cpPromoteReleaseVersion == "" || cpPromotePlatform == "" || cpPromotePatchNumber == 0) {
@@ -288,7 +352,7 @@ var codepushFlutterPromoteCmd = &cobra.Command{
 }
 
 func init() {
-	codepushFlutterPromoteCmd.Flags().StringVar(&cpPromoteAppID, "app", "", "App ID (required)")
+	codepushFlutterPromoteCmd.Flags().StringVar(&cpPromoteAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushFlutterPromoteCmd.Flags().StringVar(&cpPromoteUpdateID, "update-id", "", "Update ID (alternative to --release-version/--platform/--patch)")
 	codepushFlutterPromoteCmd.Flags().StringVar(&cpPromoteReleaseVersion, "release-version", "", "Release version the patch targets")
 	codepushFlutterPromoteCmd.Flags().StringVar(&cpPromotePlatform, "platform", "", "ANDROID or IOS")
@@ -313,8 +377,9 @@ var codepushFlutterRollbackCmd = &cobra.Command{
 	Use:   "rollback",
 	Short: "Rollback a Flutter patch",
 	Run: func(cmd *cobra.Command, args []string) {
-		if cpRollbackAppID == "" {
-			ui.Error("--app is required")
+		var ok bool
+		cpRollbackAppID, ok = resolveAppID(cpRollbackAppID)
+		if !ok {
 			return
 		}
 		if cpRollbackUpdateID == "" && (cpRollbackReleaseVersion == "" || cpRollbackPlatform == "" || cpRollbackPatchNumber == 0) {
@@ -344,7 +409,7 @@ var codepushFlutterRollbackCmd = &cobra.Command{
 }
 
 func init() {
-	codepushFlutterRollbackCmd.Flags().StringVar(&cpRollbackAppID, "app", "", "App ID (required)")
+	codepushFlutterRollbackCmd.Flags().StringVar(&cpRollbackAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushFlutterRollbackCmd.Flags().StringVar(&cpRollbackUpdateID, "update-id", "", "Update ID (alternative to --release-version/--platform/--patch)")
 	codepushFlutterRollbackCmd.Flags().StringVar(&cpRollbackReleaseVersion, "release-version", "", "Release version the patch targets")
 	codepushFlutterRollbackCmd.Flags().StringVar(&cpRollbackPlatform, "platform", "", "ANDROID or IOS")
@@ -361,8 +426,9 @@ var codepushFlutterStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show Flutter release/patch status for an app",
 	Run: func(cmd *cobra.Command, args []string) {
-		if cpStatusAppID == "" {
-			ui.Error("--app is required")
+		var ok bool
+		cpStatusAppID, ok = resolveAppID(cpStatusAppID)
+		if !ok {
 			return
 		}
 
@@ -413,7 +479,7 @@ var codepushFlutterStatusCmd = &cobra.Command{
 }
 
 func init() {
-	codepushFlutterStatusCmd.Flags().StringVar(&cpStatusAppID, "app", "", "App ID (required)")
+	codepushFlutterStatusCmd.Flags().StringVar(&cpStatusAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushFlutterCmd.AddCommand(codepushFlutterStatusCmd)
 }
 
@@ -433,8 +499,13 @@ var codepushReactNativePublishCmd = &cobra.Command{
 	Use:   "publish",
 	Short: "Publish a React Native update (runs `npx expo export`, then uploads the bundle + assets)",
 	Run: func(cmd *cobra.Command, args []string) {
-		if cpRnAppID == "" || cpRnPlatform == "" || cpRnRuntimeVersion == "" {
-			ui.Error("--app, --platform, and --runtime-version are required")
+		var ok bool
+		cpRnAppID, ok = resolveAppID(cpRnAppID)
+		if !ok {
+			return
+		}
+		if cpRnPlatform == "" || cpRnRuntimeVersion == "" {
+			ui.Error("--platform and --runtime-version are required")
 			return
 		}
 		platform, err := normalizeFlutterPlatform(cpRnPlatform) // ANDROID/IOS normalization is framework-agnostic
@@ -499,13 +570,13 @@ var codepushReactNativePublishCmd = &cobra.Command{
 			{"Channel", resp.Update.Channel},
 			{"Assets", fmt.Sprintf("%d", len(resp.Update.Assets))},
 		})
-		ui.Info("Promote it with: airbuild codepush react-native promote --app %s --update-id %s --channel %s --rollout 25",
-			cpRnAppID, resp.Update.ID, valueOr(cpRnChannel, "production"))
+		ui.Info("Promote it with: airbuild codepush react-native promote --update-id %s --channel %s --rollout 25",
+			resp.Update.ID, valueOr(cpRnChannel, "production"))
 	},
 }
 
 func init() {
-	codepushReactNativePublishCmd.Flags().StringVar(&cpRnAppID, "app", "", "App ID (required)")
+	codepushReactNativePublishCmd.Flags().StringVar(&cpRnAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushReactNativePublishCmd.Flags().StringVar(&cpRnPlatform, "platform", "", "android or ios (required)")
 	codepushReactNativePublishCmd.Flags().StringVar(&cpRnRuntimeVersion, "runtime-version", "", "Runtime version, must match expo.updates.runtimeVersion in app.json (required)")
 	codepushReactNativePublishCmd.Flags().StringVar(&cpRnChannel, "channel", "production", "Distribution channel")
@@ -530,8 +601,9 @@ var codepushReactNativePromoteCmd = &cobra.Command{
 	Use:   "promote",
 	Short: "Promote a React Native update to a channel at a rollout percentage",
 	Run: func(cmd *cobra.Command, args []string) {
-		if cpRnPromoteAppID == "" {
-			ui.Error("--app is required")
+		var ok bool
+		cpRnPromoteAppID, ok = resolveAppID(cpRnPromoteAppID)
+		if !ok {
 			return
 		}
 		if cpRnPromoteUpdateID == "" && (cpRnPromotePlatform == "" || cpRnPromoteRuntimeVersion == "") {
@@ -556,7 +628,7 @@ var codepushReactNativePromoteCmd = &cobra.Command{
 }
 
 func init() {
-	codepushReactNativePromoteCmd.Flags().StringVar(&cpRnPromoteAppID, "app", "", "App ID (required)")
+	codepushReactNativePromoteCmd.Flags().StringVar(&cpRnPromoteAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushReactNativePromoteCmd.Flags().StringVar(&cpRnPromoteUpdateID, "update-id", "", "Update ID (alternative to --platform/--runtime-version)")
 	codepushReactNativePromoteCmd.Flags().StringVar(&cpRnPromotePlatform, "platform", "", "ANDROID or IOS")
 	codepushReactNativePromoteCmd.Flags().StringVar(&cpRnPromoteRuntimeVersion, "runtime-version", "", "Runtime version the update targets")
@@ -576,8 +648,13 @@ var codepushReactNativeRollbackCmd = &cobra.Command{
 	Use:   "rollback",
 	Short: "Rollback a React Native update",
 	Run: func(cmd *cobra.Command, args []string) {
-		if cpRnRollbackAppID == "" || cpRnRollbackUpdateID == "" {
-			ui.Error("--app and --update-id are required")
+		var ok bool
+		cpRnRollbackAppID, ok = resolveAppID(cpRnRollbackAppID)
+		if !ok {
+			return
+		}
+		if cpRnRollbackUpdateID == "" {
+			ui.Error("--update-id is required")
 			return
 		}
 
@@ -595,7 +672,7 @@ var codepushReactNativeRollbackCmd = &cobra.Command{
 }
 
 func init() {
-	codepushReactNativeRollbackCmd.Flags().StringVar(&cpRnRollbackAppID, "app", "", "App ID (required)")
+	codepushReactNativeRollbackCmd.Flags().StringVar(&cpRnRollbackAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushReactNativeRollbackCmd.Flags().StringVar(&cpRnRollbackUpdateID, "update-id", "", "Update ID (required)")
 	codepushReactNativeCmd.AddCommand(codepushReactNativeRollbackCmd)
 }
@@ -608,8 +685,9 @@ var codepushReactNativeStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show React Native release/update status for an app",
 	Run: func(cmd *cobra.Command, args []string) {
-		if cpRnStatusAppID == "" {
-			ui.Error("--app is required")
+		var ok bool
+		cpRnStatusAppID, ok = resolveAppID(cpRnStatusAppID)
+		if !ok {
 			return
 		}
 
@@ -661,11 +739,27 @@ var codepushReactNativeStatusCmd = &cobra.Command{
 }
 
 func init() {
-	codepushReactNativeStatusCmd.Flags().StringVar(&cpRnStatusAppID, "app", "", "App ID (required)")
+	codepushReactNativeStatusCmd.Flags().StringVar(&cpRnStatusAppID, "app", "", "App ID (defaults to .airbuild.json)")
 	codepushReactNativeCmd.AddCommand(codepushReactNativeStatusCmd)
 }
 
 // --- helpers ---
+
+// resolveAppID returns the --app flag value if set, otherwise falls back to
+// the AppID stored in .airbuild.json by `airbuild init`. On failure it prints
+// an error and returns ok=false so the caller can `return`.
+func resolveAppID(flagValue string) (string, bool) {
+	if flagValue != "" {
+		return flagValue, true
+	}
+	projCfg, err := project.Load()
+	if err != nil {
+		ui.Error("--app is required (or run `airbuild init` to set a default): %v", err)
+		return "", false
+	}
+	ui.Muted("Using app %s from .airbuild.json", projCfg.AppID)
+	return projCfg.AppID, true
+}
 
 func normalizeFlutterPlatform(p string) (string, error) {
 	switch strings.ToLower(p) {
@@ -676,6 +770,106 @@ func normalizeFlutterPlatform(p string) (string, error) {
 	default:
 		return "", fmt.Errorf("platform must be android or ios, got: %s", p)
 	}
+}
+
+// runAndroidAutoDiff implements the full Android auto-diff flow (Phase 2):
+// build via shorebird patch --dry-run, locate libapp.so, download the release
+// libapp.so from AirBuild, and create the diff using Shorebird's cached
+// patch binary. Returns the path to the generated diff file.
+func runAndroidAutoDiff(platformArg, releaseVersion string, skipBuild bool, architecture, channel, appID string) (string, error) {
+	// Step 1: Build the patch's libapp.so (dry-run = build but don't upload
+	// to Shorebird's cloud).
+	if !skipBuild {
+		ui.Info("Running `shorebird patch %s --dry-run` (building patch artifact)...", platformArg)
+		releaseVersionArgs := []string{"patch", platformArg, "--dry-run"}
+		if releaseVersion != "" {
+			releaseVersionArgs = append(releaseVersionArgs, "--release-version", releaseVersion)
+		}
+		if err := shorebird.Run(".", releaseVersionArgs...); err != nil {
+			return "", fmt.Errorf("shorebird patch --dry-run failed: %w", err)
+		}
+	}
+
+	// Step 2: Locate the freshly built patch libapp.so.
+	patchLibapp, err := shorebird.FindAndroidLibapp(".", architecture)
+	if err != nil {
+		return "", err
+	}
+	ui.Muted("Found patch libapp.so: %s", patchLibapp)
+
+	// Step 3: Locate Shorebird's cached `patch` binary (for diffing).
+	patchBinary, err := shorebird.FindPatchBinary()
+	if err != nil {
+		return "", err
+	}
+	ui.Muted("Using Shorebird patch binary: %s", patchBinary)
+
+	// Step 4: Download the release's original libapp.so from AirBuild.
+	cfg := mustLoadConfig()
+	client := api.New(cfg.APIURL, cfg.APIKey)
+
+	ui.Info("Downloading release %s libapp.so from AirBuild...", releaseVersion)
+	dlResp, err := client.CodePushFlutterReleaseDownload(
+		appID, releaseVersion, "ANDROID", architecture, channel,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to get release download URL: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "airbuild-patch-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir) //nolint:errcheck
+
+	releaseLibappPath := filepath.Join(tmpDir, "release-libapp.so")
+	if err := client.DownloadFile(dlResp.DownloadUrl, releaseLibappPath); err != nil {
+		return "", fmt.Errorf("failed to download release libapp.so: %w", err)
+	}
+	ui.Muted("Downloaded release libapp.so (%s) to %s", dlResp.Release.Version, releaseLibappPath)
+
+	// Step 5: Create the binary diff using Shorebird's patch binary.
+	diffPath := filepath.Join(tmpDir, "patch.diff")
+	ui.Info("Creating binary diff...")
+	if err := shorebird.CreateDiff(patchBinary, releaseLibappPath, patchLibapp, diffPath); err != nil {
+		return "", fmt.Errorf("failed to create diff: %w", err)
+	}
+
+	ui.Muted("Created diff: %s", diffPath)
+	return diffPath, nil
+}
+
+// runIOSAutoDiff implements the iOS Phase 1 auto-diff flow: run
+// `shorebird patch ios --dry-run`, then scan the OS temp directory for the
+// diff.patch file that Shorebird creates in a random temp dir. This is
+// best-effort — if the scan fails, the user falls back to --artifact.
+//
+// Phase 2 (full iOS auto-diff using aot_tools + analyze_snapshot + patch
+// binaries) is tracked as a future task — see docs/CHECKLIST.md §5.2d.
+func runIOSAutoDiff(platformArg, releaseVersion string, skipBuild bool) (string, error) {
+	// Record the timestamp before building so we can filter temp files.
+	buildStart := time.Now()
+
+	if !skipBuild {
+		ui.Info("Running `shorebird patch %s --dry-run` (building + creating diff)...", platformArg)
+		releaseVersionArgs := []string{"patch", platformArg, "--dry-run"}
+		if releaseVersion != "" {
+			releaseVersionArgs = append(releaseVersionArgs, "--release-version", releaseVersion)
+		}
+		if err := shorebird.Run(".", releaseVersionArgs...); err != nil {
+			return "", fmt.Errorf("shorebird patch --dry-run failed: %w", err)
+		}
+	}
+
+	// Scan the OS temp dir for a diff.patch modified after buildStart.
+	ui.Info("Scanning temp directory for the generated diff...")
+	diffPath, err := shorebird.FindRecentDiffPatch(buildStart)
+	if err != nil {
+		return "", err
+	}
+
+	ui.Muted("Found diff: %s", diffPath)
+	return diffPath, nil
 }
 
 func valueOr(v, fallback string) string {
