@@ -174,6 +174,25 @@ func CreateDiff(patchBinary, releaseArtifactPath, patchArtifactPath, diffPath st
 	return nil
 }
 
+// zstdMagicBytes are the 4 magic bytes (little-endian 0xFD2FB528) that
+// every zstd-compressed frame starts with. Shorebird's `patch` binary
+// produces bidiff diffs compressed with zstd, so a well-formed diff.patch
+// must start with these bytes. Checking for them lets us detect a
+// misidentified file (e.g. an unrelated diff.patch from another tool)
+// before uploading it as a CodePush patch.
+var zstdMagicBytes = []byte{0x28, 0xB5, 0x2F, 0xFD}
+
+// FindRecentDiffPatchResult is the result of scanning for a recently
+// created diff.patch file.
+type FindRecentDiffPatchResult struct {
+	// Path is the most likely diff.patch file (most recently modified).
+	Path string
+	// AmbiguousMatches lists any other candidates found alongside Path.
+	// A non-empty list means the scan can't be fully certain it picked
+	// the right file (e.g. a concurrent build also created a diff.patch).
+	AmbiguousMatches []string
+}
+
 // FindRecentDiffPatch scans the OS temp directory for files named
 // "diff.patch" that were modified after the given timestamp. This is used
 // for iOS Phase 1 auto-diff: `shorebird patch ios --dry-run` creates the
@@ -181,15 +200,17 @@ func CreateDiff(patchBinary, releaseArtifactPath, patchArtifactPath, diffPath st
 // and this function locates it by scanning for recently-created diff.patch
 // files.
 //
-// Returns the path to the most recently modified matching file, or an error
-// if none is found. The caller should record the timestamp before running
-// the shorebird command and pass it here as `since`.
+// Returns the most recently modified matching file, plus any other matches
+// found (which the caller should surface as a warning — see
+// FindRecentDiffPatchResult.AmbiguousMatches). Returns an error if none is
+// found. The caller should record the timestamp before running the
+// shorebird command and pass it here as `since`.
 //
 // This is inherently a best-effort scan — if the OS cleans temp files
 // aggressively, or if another process creates a diff.patch concurrently,
-// the result may be wrong. The caller should validate the file before
-// uploading.
-func FindRecentDiffPatch(since time.Time) (string, error) {
+// the result may be wrong. Callers should also run ValidateDiffFile on the
+// result before uploading.
+func FindRecentDiffPatch(since time.Time) (FindRecentDiffPatchResult, error) {
 	tempDir := os.TempDir()
 	var matches []string
 
@@ -214,7 +235,7 @@ func FindRecentDiffPatch(since time.Time) (string, error) {
 	})
 
 	if len(matches) == 0 {
-		return "", fmt.Errorf(
+		return FindRecentDiffPatchResult{}, fmt.Errorf(
 			"no diff.patch found in %s modified after %s — shorebird patch may have failed, or the temp dir was cleaned. Pass --artifact <path> explicitly",
 			tempDir,
 			since.Format(time.RFC3339),
@@ -228,5 +249,45 @@ func FindRecentDiffPatch(since time.Time) (string, error) {
 		return fi.ModTime().After(fj.ModTime())
 	})
 
-	return matches[0], nil
+	return FindRecentDiffPatchResult{
+		Path:             matches[0],
+		AmbiguousMatches: matches[1:],
+	}, nil
+}
+
+// ValidateDiffFile does a best-effort sanity check on a diff file before
+// it's uploaded as a CodePush patch: it must exist, be non-empty, and
+// start with the zstd magic bytes that Shorebird's `patch` binary always
+// produces. This can't guarantee the diff is byte-for-byte correct (that
+// requires the Shorebird updater on a real device), but it catches the
+// common failure modes of the iOS temp-dir scan: an empty/truncated file,
+// or a diff.patch belonging to an unrelated tool/process.
+func ValidateDiffFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("diff file not found: %w", err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("diff file %s is empty — shorebird patch may have failed partway through", path)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("could not open diff file %s: %w", path, err)
+	}
+	defer f.Close() //nolint:errcheck
+
+	header := make([]byte, len(zstdMagicBytes))
+	if _, err := f.Read(header); err != nil {
+		return fmt.Errorf("could not read diff file %s: %w", path, err)
+	}
+	for i, b := range zstdMagicBytes {
+		if header[i] != b {
+			return fmt.Errorf(
+				"diff file %s does not look like a valid Shorebird patch (missing zstd magic bytes) — it may belong to an unrelated tool. Pass --artifact <path> explicitly with a known-good diff",
+				path,
+			)
+		}
+	}
+	return nil
 }

@@ -276,25 +276,23 @@ airbuild codepush flutter patch ios --release-version 1.0.0+1 --artifact patch.d
 | `--artifact` | no | auto-diff | Path to a pre-built diff (skips auto-diff) |
 | `--skip-build` | no | `false` | Don't run `shorebird patch` — use existing build or `--artifact` |
 
-**Android auto-diff flow** (when `--artifact` is omitted):
+**Auto-diff** (when `--artifact` is omitted): the CLI builds your patch
+locally, computes a binary diff against the release, and uploads just the
+diff to AirBuild — you don't need to locate or pass the artifact yourself.
 
-1. Runs `shorebird patch android --dry-run` (builds `libapp.so`, doesn't upload to Shorebird)
-2. Locates the freshly built `libapp.so` in Flutter's Gradle output
-3. Downloads the release's original `libapp.so` from AirBuild
-4. Uses Shorebird's cached `patch` binary (`~/.shorebird/bin/cache/artifacts/patch/patch`) to create the bidiff+zstd diff
-5. Uploads the diff to AirBuild
+- **Android** is fully automatic.
+- **iOS** is best-effort: the CLI scans the OS temp directory for the
+  `diff.patch` Shorebird generates, warns you if it finds more than one
+  candidate, and validates the result (non-empty, correct zstd header)
+  before uploading. If the scan fails or fails validation (e.g. due to
+  aggressive temp-file cleanup or a concurrent build), it'll tell you to
+  fall back to `--artifact` with a manually-created diff. A fully
+  deterministic iOS flow was investigated and intentionally deferred — see
+  `docs/CHECKLIST.md` §5.2d.
 
-**iOS auto-diff flow** (Phase 1 — best-effort, when `--artifact` is omitted):
-
-1. Records the current timestamp
-2. Runs `shorebird patch ios --dry-run` (builds + creates the diff in a random temp dir, doesn't upload to Shorebird)
-3. Scans the OS temp directory for a `diff.patch` file modified after the build started
-4. Uploads the located diff to AirBuild
-
-If the iOS temp-dir scan fails (aggressive temp cleanup, concurrent
-builds), fall back to `--artifact`. A future Phase 2 will drive Shorebird's
-`aot_tools` + `analyze_snapshot` + `patch` binaries directly to remove
-this limitation — see `docs/CHECKLIST.md` §5.2d.
+`--platform` and `--rollout` are validated client-side on `promote` and
+`rollback` (platform must be `android`/`ios`, rollout must be 0–100) so
+typos fail fast with a clear message instead of a confusing server error.
 
 #### `airbuild codepush flutter promote`
 
@@ -410,24 +408,20 @@ airbuild codepush react-native status
 
 ### CodePush limitations
 
-- **iOS auto-diff is best-effort (Phase 1).** The CLI runs
-  `shorebird patch ios --dry-run` and scans the OS temp directory for the
-  resulting `diff.patch`. Shorebird writes the diff to a random temp
-  directory, so the scan can fail if temp files are cleaned aggressively or
-  another build runs concurrently. If the scan fails, pass `--artifact`
-  explicitly. Phase 2 (full iOS auto-diff via `aot_tools` +
-  `analyze_snapshot` + `patch` binaries) is tracked in
-  `docs/CHECKLIST.md` §5.2d.
+- **iOS auto-diff is best-effort.** It scans for and validates the
+  generated diff rather than driving Shorebird's diff tooling directly
+  (deliberately deferred — see `docs/CHECKLIST.md` §5.2d). If it can't
+  locate or validate the diff, it'll tell you to pass `--artifact`
+  explicitly with a manually created diff.
 - **Multi-architecture releases store one `storageKey`.** When you upload
   multiple architectures for the same release (e.g. `arm64-v8a` +
   `armeabi-v7a`), only the last-uploaded architecture's storage key is
   retained. For multi-arch setups, either upload one architecture per
   release or use `--artifact` to diff against a specific arch.
-- **Android auto-diff depends on Shorebird's cached `patch` binary.** The
-  auto-diff flow uses Shorebird's `patch` binary at
-  `~/.shorebird/bin/cache/artifacts/patch/patch`. If a future Shorebird
-  release moves it, the CLI falls back to a clear error asking you to pass
-  `--artifact` manually.
+- **Android auto-diff requires the Shorebird CLI to be installed and run
+  at least once**, so its local tooling cache is populated. If that
+  tooling changes in a future Shorebird release, the CLI falls back to a
+  clear error asking you to pass `--artifact` manually.
 - **Patches are Dart-only (Flutter).** Native code changes and asset
   changes cannot be patched — you need a new release for those.
 - **One release per version + channel.** Re-registering the same version

@@ -263,7 +263,7 @@ manually:
 		} else {
 			// --- Explicit --artifact flow (original behavior) ---
 			if !cpPatchSkipBuild && shorebird.IsInstalled() {
-				ui.Info("Running `shorebird patch %s` (for its build/diff side effects)...", platformArg)
+				ui.Info("Running `shorebird patch %s`...", platformArg)
 				if err := shorebird.Run(".", "patch", platformArg, "--no-confirm"); err != nil {
 					ui.Warn("shorebird patch reported an error (continuing with --artifact anyway): %v", err)
 				}
@@ -329,6 +329,15 @@ var codepushFlutterPromoteCmd = &cobra.Command{
 			ui.Error("Provide --update-id, or --release-version + --platform + --patch")
 			return
 		}
+		platform, err := normalizePlatformFlag(cpPromotePlatform)
+		if err != nil {
+			ui.Error("%v", err)
+			return
+		}
+		if err := validateRolloutPercent(cpPromoteRollout); err != nil {
+			ui.Error("%v", err)
+			return
+		}
 
 		cfg := mustLoadConfig()
 		client := api.New(cfg.APIURL, cfg.APIKey)
@@ -337,7 +346,7 @@ var codepushFlutterPromoteCmd = &cobra.Command{
 			AppID:          cpPromoteAppID,
 			UpdateID:       cpPromoteUpdateID,
 			ReleaseVersion: cpPromoteReleaseVersion,
-			Platform:       strings.ToUpper(cpPromotePlatform),
+			Platform:       platform,
 			PatchNumber:    cpPromotePatchNumber,
 			Channel:        cpPromoteChannel,
 		}
@@ -386,6 +395,11 @@ var codepushFlutterRollbackCmd = &cobra.Command{
 			ui.Error("Provide --update-id, or --release-version + --platform + --patch")
 			return
 		}
+		platform, err := normalizePlatformFlag(cpRollbackPlatform)
+		if err != nil {
+			ui.Error("%v", err)
+			return
+		}
 
 		cfg := mustLoadConfig()
 		client := api.New(cfg.APIURL, cfg.APIKey)
@@ -394,7 +408,7 @@ var codepushFlutterRollbackCmd = &cobra.Command{
 			AppID:          cpRollbackAppID,
 			UpdateID:       cpRollbackUpdateID,
 			ReleaseVersion: cpRollbackReleaseVersion,
-			Platform:       strings.ToUpper(cpRollbackPlatform),
+			Platform:       platform,
 			PatchNumber:    cpRollbackPatchNumber,
 			Channel:        cpRollbackChannel,
 		}
@@ -452,14 +466,14 @@ var codepushFlutterStatusCmd = &cobra.Command{
 		}
 
 		if len(resp.Releases) == 0 {
-			ui.Muted("No releases yet.")
+			ui.Muted("No releases yet. Register one with: airbuild codepush flutter release android --version 1.0.0+1")
 			return
 		}
 
 		for _, r := range resp.Releases {
 			ui.Header("Release %s (%s, %s)", r.Version, r.Platform, r.Channel)
 			if len(r.Updates) == 0 {
-				ui.Muted("  No patches yet.")
+				ui.Muted("  No patches yet. Create one with: airbuild codepush flutter patch %s --release-version %s", strings.ToLower(r.Platform), r.Version)
 				continue
 			}
 			rows := make([][]string, 0, len(r.Updates))
@@ -610,12 +624,21 @@ var codepushReactNativePromoteCmd = &cobra.Command{
 			ui.Error("Provide --update-id, or --platform + --runtime-version")
 			return
 		}
+		platform, err := normalizePlatformFlag(cpRnPromotePlatform)
+		if err != nil {
+			ui.Error("%v", err)
+			return
+		}
+		if err := validateRolloutPercent(cpRnPromoteRollout); err != nil {
+			ui.Error("%v", err)
+			return
+		}
 
 		cfg := mustLoadConfig()
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		resp, err := client.CodePushReactNativePromote(
-			cpRnPromoteAppID, cpRnPromoteUpdateID, strings.ToUpper(cpRnPromotePlatform), cpRnPromoteRuntimeVersion,
+			cpRnPromoteAppID, cpRnPromoteUpdateID, platform, cpRnPromoteRuntimeVersion,
 			cpRnPromoteChannel, cpRnPromoteRollout,
 		)
 		if err != nil {
@@ -711,14 +734,14 @@ var codepushReactNativeStatusCmd = &cobra.Command{
 		}
 
 		if len(resp.Releases) == 0 {
-			ui.Muted("No releases yet.")
+			ui.Muted("No releases yet. Publish one with: airbuild codepush react-native publish --platform android --runtime-version 1.0.0")
 			return
 		}
 
 		for _, r := range resp.Releases {
 			ui.Header("Runtime %s (%s, %s)", r.Version, r.Platform, r.Channel)
 			if len(r.Updates) == 0 {
-				ui.Muted("  No updates yet.")
+				ui.Muted("  No updates yet. Publish one with: airbuild codepush react-native publish --platform %s --runtime-version %s", strings.ToLower(r.Platform), r.Version)
 				continue
 			}
 			rows := make([][]string, 0, len(r.Updates))
@@ -770,6 +793,30 @@ func normalizeFlutterPlatform(p string) (string, error) {
 	default:
 		return "", fmt.Errorf("platform must be android or ios, got: %s", p)
 	}
+}
+
+// normalizePlatformFlag validates an optional --platform flag shared by the
+// promote/rollback commands (Flutter and React Native). An empty string is
+// passed through as-is (the caller is expected to be using --update-id
+// instead, which doesn't need a platform). A non-empty value must be
+// "android" or "ios" (case-insensitive) — this catches typos early instead
+// of silently forwarding a garbage value (e.g. "andriod" -> "ANDRIOD") to
+// the server, where it would fail with a less obvious error.
+func normalizePlatformFlag(p string) (string, error) {
+	if p == "" {
+		return "", nil
+	}
+	return normalizeFlutterPlatform(p)
+}
+
+// validateRolloutPercent checks that a --rollout value is in the valid
+// 0-100 range before sending it to the server, so mistakes (e.g. a typo
+// like --rollout 1000) are caught immediately with a clear message.
+func validateRolloutPercent(pct int) error {
+	if pct < 0 || pct > 100 {
+		return fmt.Errorf("--rollout must be between 0 and 100, got: %d", pct)
+	}
+	return nil
 }
 
 // runAndroidAutoDiff implements the full Android auto-diff flow (Phase 2):
@@ -834,6 +881,9 @@ func runAndroidAutoDiff(platformArg, releaseVersion string, skipBuild bool, arch
 	if err := shorebird.CreateDiff(patchBinary, releaseLibappPath, patchLibapp, diffPath); err != nil {
 		return "", fmt.Errorf("failed to create diff: %w", err)
 	}
+	if err := shorebird.ValidateDiffFile(diffPath); err != nil {
+		return "", fmt.Errorf("generated diff failed validation: %w", err)
+	}
 
 	ui.Muted("Created diff: %s", diffPath)
 	return diffPath, nil
@@ -844,8 +894,15 @@ func runAndroidAutoDiff(platformArg, releaseVersion string, skipBuild bool, arch
 // diff.patch file that Shorebird creates in a random temp dir. This is
 // best-effort — if the scan fails, the user falls back to --artifact.
 //
-// Phase 2 (full iOS auto-diff using aot_tools + analyze_snapshot + patch
-// binaries) is tracked as a future task — see docs/CHECKLIST.md §5.2d.
+// Full Phase 2 (driving aot_tools + analyze_snapshot + patch directly) was
+// investigated and deliberately deferred: Shorebird's aot_tools is not a
+// stable standalone binary — recent versions distribute it as a compiled
+// Dart kernel (.dill) invoked via Shorebird's own bundled `dart run`, with
+// cache paths resolved by internal, version-dependent logic. Hand-rolling
+// that is high-risk for a production OTA tool (a subtly wrong diff base
+// would produce a patch that corrupts or crashes the app on real devices,
+// rather than failing loudly). See docs/CHECKLIST.md §5.2d for the full
+// research writeup and re-evaluation criteria.
 func runIOSAutoDiff(platformArg, releaseVersion string, skipBuild bool) (string, error) {
 	// Record the timestamp before building so we can filter temp files.
 	buildStart := time.Now()
@@ -863,13 +920,24 @@ func runIOSAutoDiff(platformArg, releaseVersion string, skipBuild bool) (string,
 
 	// Scan the OS temp dir for a diff.patch modified after buildStart.
 	ui.Info("Scanning temp directory for the generated diff...")
-	diffPath, err := shorebird.FindRecentDiffPatch(buildStart)
+	result, err := shorebird.FindRecentDiffPatch(buildStart)
 	if err != nil {
 		return "", err
 	}
+	if len(result.AmbiguousMatches) > 0 {
+		ui.Warn("Found %d other diff.patch file(s) created around the same time — picked the most recent one (%s). If this is wrong, pass --artifact explicitly:",
+			len(result.AmbiguousMatches), result.Path)
+		for _, m := range result.AmbiguousMatches {
+			ui.Warn("  - %s", m)
+		}
+	}
 
-	ui.Muted("Found diff: %s", diffPath)
-	return diffPath, nil
+	if err := shorebird.ValidateDiffFile(result.Path); err != nil {
+		return "", fmt.Errorf("%w (this can happen if the temp-dir scan picked up a stale or unrelated file)", err)
+	}
+
+	ui.Muted("Found diff: %s", result.Path)
+	return result.Path, nil
 }
 
 func valueOr(v, fallback string) string {
