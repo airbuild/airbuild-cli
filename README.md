@@ -211,9 +211,8 @@ No manual download or PATH changes needed.
 ## CodePush / OTA updates
 
 Push code-only updates to your apps without a store re-submission. AirBuild
-CodePush supports **Flutter** (via Shorebird's updater) and **React Native**
-(via the Expo Updates protocol) with independent feature flags, channels,
-staged rollout, and instant rollback.
+CodePush supports **Flutter** and **React Native** with independent feature
+flags, channels, staged rollout, and instant rollback.
 
 > **Prerequisite:** Run `airbuild init` first. It creates `.airbuild.json`
 > in your project root, linking your app so you don't need `--app` on every
@@ -226,12 +225,17 @@ staged rollout, and instant rollback.
 
 ### Flutter CodePush
 
-Wraps the [Shorebird CLI](https://pub.dev/packages/shorebird_cli) — install
-it first with `dart pub global activate shorebird_cli`.
+Requires the [Shorebird CLI](https://pub.dev/packages/shorebird_cli):
+
+```bash
+dart pub global activate shorebird_cli
+```
+
+Your app must be built with the Shorebird updater embedded. See the [Shorebird docs](https://shorebird.dev/) for setup.
 
 #### `airbuild codepush flutter release`
 
-Register a Flutter release (runs `shorebird release`, then uploads the artifact).
+Register a Flutter release. The CLI builds the release locally and uploads it to AirBuild.
 
 ```bash
 airbuild codepush flutter release android --version 1.0.0+1
@@ -246,24 +250,21 @@ airbuild codepush flutter release android --version 1.0.0+1
 | `--flutter-revision` | no | — | Flutter SDK version used |
 | `--shorebird-app-id` | no | — | Shorebird app_id |
 | `--release-notes` | no | — | Release notes |
-| `--artifact` | no | auto-detect | Path to libapp.so (skips build) |
-| `--skip-build` | no | `false` | Don't run `shorebird release` |
+| `--artifact` | no | auto-detect | Path to a pre-built release artifact (skips the build step) |
+| `--skip-build` | no | `false` | Don't build — just upload `--artifact` |
 
 #### `airbuild codepush flutter patch`
 
-Create a Flutter patch. Without `--artifact`, the CLI auto-diffs against
-the release:
+Create a Flutter patch. The CLI builds your patched app, computes a diff against the release, and uploads it — no manual diffing required.
 
 ```bash
-# Auto-diff (Android — full flow, no --artifact needed):
 airbuild codepush flutter patch android --release-version 1.0.0+1
+```
 
-# Auto-diff (iOS — best-effort temp-dir scan, see limitations):
-airbuild codepush flutter patch ios --release-version 1.0.0+1
+If the CLI can't locate the generated diff (e.g. on iOS in some environments), pass `--artifact` with a pre-built diff:
 
-# Manual diff (custom CI, or when auto-diff can't locate the artifact):
-shorebird patch ios
-airbuild codepush flutter patch ios --release-version 1.0.0+1 --artifact patch.diff
+```bash
+airbuild codepush flutter patch ios --release-version 1.0.0+1 --artifact path/to/patch.diff
 ```
 
 | Flag | Required | Default | Description |
@@ -273,26 +274,9 @@ airbuild codepush flutter patch ios --release-version 1.0.0+1 --artifact patch.d
 | `--architecture` | no | — | Target architecture |
 | `--channel` | no | `production` | Distribution channel |
 | `--release-notes` | no | — | Patch notes |
-| `--artifact` | no | auto-diff | Path to a pre-built diff (skips auto-diff) |
-| `--skip-build` | no | `false` | Don't run `shorebird patch` — use existing build or `--artifact` |
+| `--artifact` | no | auto | Path to a pre-built diff (skips the build step) |
+| `--skip-build` | no | `false` | Don't build — use existing build output or `--artifact` |
 
-**Auto-diff** (when `--artifact` is omitted): the CLI builds your patch
-locally, computes a binary diff against the release, and uploads just the
-diff to AirBuild — you don't need to locate or pass the artifact yourself.
-
-- **Android** is fully automatic.
-- **iOS** is best-effort: the CLI scans the OS temp directory for the
-  `diff.patch` Shorebird generates, warns you if it finds more than one
-  candidate, and validates the result (non-empty, correct zstd header)
-  before uploading. If the scan fails or fails validation (e.g. due to
-  aggressive temp-file cleanup or a concurrent build), it'll tell you to
-  fall back to `--artifact` with a manually-created diff. A fully
-  deterministic iOS flow was investigated and intentionally deferred — see
-  `docs/CHECKLIST.md` §5.2d.
-
-`--platform` and `--rollout` are validated client-side on `promote` and
-`rollback` (platform must be `android`/`ios`, rollout must be 0–100) so
-typos fail fast with a clear message instead of a confusing server error.
 
 #### `airbuild codepush flutter promote`
 
@@ -343,12 +327,11 @@ airbuild codepush flutter status
 
 ### React Native CodePush
 
-Uses the [Expo Updates v1 protocol](https://docs.expo.dev/technical-specs/expo-updates-1/).
 Requires `expo-updates` in your app and `npx` on your PATH.
 
 #### `airbuild codepush react-native publish`
 
-Publish an update (runs `npx expo export`, then uploads bundle + assets).
+Publish an update. The CLI exports your bundle and assets locally, then uploads them to AirBuild.
 
 ```bash
 airbuild codepush react-native publish --platform android --runtime-version 1.0.0
@@ -362,7 +345,7 @@ airbuild codepush react-native publish --platform android --runtime-version 1.0.
 | `--channel` | no | `production` | Distribution channel |
 | `--release-notes` | no | — | Release notes |
 | `--output-dir` | no | `dist` | Export directory |
-| `--skip-export` | no | `false` | Don't run `expo export` — read `--output-dir` |
+| `--skip-export` | no | `false` | Don't export — read `--output-dir` |
 
 #### `airbuild codepush react-native promote`
 
@@ -408,25 +391,10 @@ airbuild codepush react-native status
 
 ### CodePush limitations
 
-- **iOS auto-diff is best-effort.** It scans for and validates the
-  generated diff rather than driving Shorebird's diff tooling directly
-  (deliberately deferred — see `docs/CHECKLIST.md` §5.2d). If it can't
-  locate or validate the diff, it'll tell you to pass `--artifact`
-  explicitly with a manually created diff.
-- **Multi-architecture releases store one `storageKey`.** When you upload
-  multiple architectures for the same release (e.g. `arm64-v8a` +
-  `armeabi-v7a`), only the last-uploaded architecture's storage key is
-  retained. For multi-arch setups, either upload one architecture per
-  release or use `--artifact` to diff against a specific arch.
-- **Android auto-diff requires the Shorebird CLI to be installed and run
-  at least once**, so its local tooling cache is populated. If that
-  tooling changes in a future Shorebird release, the CLI falls back to a
-  clear error asking you to pass `--artifact` manually.
-- **Patches are Dart-only (Flutter).** Native code changes and asset
-  changes cannot be patched — you need a new release for those.
-- **One release per version + channel.** Re-registering the same version
-  on the same channel appends architectures to the existing release
-  rather than creating a new one.
+- **iOS patch creation may require `--artifact`.** On iOS, the CLI can't always locate the generated diff automatically. If that happens, pass `--artifact` with a pre-built diff file.
+- **Multi-architecture releases.** When you upload multiple architectures for the same release (e.g. `arm64-v8a` + `armeabi-v7a`), only the last-uploaded architecture is retained. For multi-arch setups, either upload one architecture per release or use `--artifact` to target a specific arch.
+- **Patches are Dart-only (Flutter).** Native code changes and asset changes cannot be patched — you need a new release for those.
+- **One release per version + channel.** Re-registering the same version on the same channel appends architectures to the existing release rather than creating a new one.
 
 ### Typical workflow
 
