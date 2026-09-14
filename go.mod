@@ -1,4 +1,4 @@
-module github.com/airbuild/cli
+module github.com/airbuild/airbuild-cli
 
 go 1.23
 

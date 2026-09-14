@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/airbuild/cli/internal/api"
-	"github.com/airbuild/cli/internal/project"
-	"github.com/airbuild/cli/internal/ui"
+	"github.com/airbuild/airbuild-cli/internal/api"
+	"github.com/airbuild/airbuild-cli/internal/project"
+	"github.com/airbuild/airbuild-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -18,7 +18,6 @@ var pushPlatform string
 var pushRelease bool
 var pushDebug bool
 var pushAll bool
-var pushExpiry int
 var pushJSON bool
 var pushReleaseNotes string
 
@@ -35,7 +34,6 @@ Examples:
   airbuild push --platform android           # Push Android release
   airbuild push --platform ios --debug       # Push iOS debug
   airbuild push --all                        # Push both platforms
-  airbuild push --release --expiry 30        # Push with 30-day link expiry
   airbuild push --json                       # JSON output for CI/CD`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Load project config
@@ -130,7 +128,7 @@ type pushResult struct {
 	Version    string `json:"version,omitempty"`
 	Slug       string `json:"slug,omitempty"`
 	InstallURL string `json:"installUrl,omitempty"`
-	Expiry     string `json:"expiry,omitempty"`
+	Expiry     string `json:"expiry,omitempty"` // reserved for future use
 }
 
 func pushSingle(client *api.Client, projCfg *project.ProjectConfig, platform, buildType, baseURL string) pushResult {
@@ -192,11 +190,6 @@ func pushSingle(client *api.Client, projCfg *project.ProjectConfig, platform, bu
 		result.InstallURL = fmt.Sprintf("%s/i/%s", baseURL, resp.InstallLink.Slug)
 	}
 
-	// Handle expiry info
-	if pushExpiry > 0 {
-		result.Expiry = fmt.Sprintf("%d days", pushExpiry)
-	}
-
 	ui.Success("Uploaded %s %s in %s", platform, buildType, elapsed)
 	return result
 }
@@ -238,7 +231,6 @@ func init() {
 	pushCmd.Flags().BoolVar(&pushRelease, "release", false, "Push release build (default)")
 	pushCmd.Flags().BoolVar(&pushDebug, "debug", false, "Push debug build")
 	pushCmd.Flags().BoolVar(&pushAll, "all", false, "Push all configured platforms")
-	pushCmd.Flags().IntVar(&pushExpiry, "expiry", 0, "Install link expiry in days (0 = plan default)")
 	pushCmd.Flags().BoolVar(&pushJSON, "json", false, "Output results as JSON (for CI/CD)")
 	pushCmd.Flags().StringVar(&pushReleaseNotes, "release-notes", "", "Release notes for this build")
 	rootCmd.AddCommand(pushCmd)

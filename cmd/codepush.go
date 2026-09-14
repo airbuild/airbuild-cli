@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/airbuild/cli/internal/api"
-	"github.com/airbuild/cli/internal/expo"
-	"github.com/airbuild/cli/internal/project"
-	"github.com/airbuild/cli/internal/shorebird"
-	"github.com/airbuild/cli/internal/ui"
+	"github.com/airbuild/airbuild-cli/internal/api"
+	"github.com/airbuild/airbuild-cli/internal/expo"
+	"github.com/airbuild/airbuild-cli/internal/project"
+	"github.com/airbuild/airbuild-cli/internal/shorebird"
+	"github.com/airbuild/airbuild-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 

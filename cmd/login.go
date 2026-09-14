@@ -1,9 +1,9 @@
 package cmd
 
 import (
-	"github.com/airbuild/cli/internal/api"
-	"github.com/airbuild/cli/internal/config"
-	"github.com/airbuild/cli/internal/ui"
+	"github.com/airbuild/airbuild-cli/internal/api"
+	"github.com/airbuild/airbuild-cli/internal/config"
+	"github.com/airbuild/airbuild-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 

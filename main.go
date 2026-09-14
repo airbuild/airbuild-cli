@@ -1,6 +1,6 @@
 package main
 
-import "github.com/airbuild/cli/cmd"
+import "github.com/airbuild/airbuild-cli/cmd"
 
 // version is set at build time via -ldflags "-X main.version=..."
 // Defaults to "dev" when built without ldflags (e.g. go run, go build).

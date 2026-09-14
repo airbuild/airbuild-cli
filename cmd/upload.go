@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/airbuild/cli/internal/api"
-	"github.com/airbuild/cli/internal/ui"
+	"github.com/airbuild/airbuild-cli/internal/api"
+	"github.com/airbuild/airbuild-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 

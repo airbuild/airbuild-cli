@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/airbuild/cli/internal/project"
+	"github.com/airbuild/airbuild-cli/internal/project"
 )
 
 // chdir changes the working directory for the duration of the test and

@@ -132,7 +132,6 @@ airbuild push                              # Push release (auto platform)
 airbuild push --platform android           # Push Android release
 airbuild push --platform ios --debug       # Push iOS debug
 airbuild push --all                        # Push both platforms
-airbuild push --release --expiry 30        # Push with 30-day link expiry
 airbuild push --json                       # JSON output for CI/CD
 airbuild push --release-notes "Bug fixes"  # Include release notes
 ```
@@ -143,7 +142,6 @@ airbuild push --release-notes "Bug fixes"  # Include release notes
 | `--release`       | Upload the release build                           | yes      |
 | `--debug`         | Upload the debug build                             | no       |
 | `--all`           | Upload all configured platforms                    | no       |
-| `--expiry`        | Install link expiry in days (0 = plan default)     | 0        |
 | `--json`          | Output results as JSON (for CI/CD)                | no       |
 | `--release-notes` | Release notes for this build                       | none     |
 
