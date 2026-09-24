@@ -133,6 +133,7 @@ type App struct {
 	IOSBundleID     string   `json:"iosBundleId"`
 	AndroidBundleID string   `json:"androidBundleId"`
 	IconURL         string   `json:"iconUrl"`
+	DistributionKey string   `json:"distributionKey"`
 	CreatedAt       string   `json:"createdAt"`
 	UpdatedAt       string   `json:"updatedAt"`
 	Count           struct {

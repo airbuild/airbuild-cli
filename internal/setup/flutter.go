@@ -5,7 +5,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/airbuild/airbuild-cli/internal/config"
 	"github.com/airbuild/airbuild-cli/internal/project"
 )
 
@@ -25,16 +24,20 @@ func FlutterChecklist() Checklist {
 // FlutterInstallActions returns the checks that `install` can fix.
 func FlutterInstallActions() Checklist {
 	return Checklist{
-		{Name: "shorebird", Run: checkShorebird, Fix: installShorebird, FixOn: "install"},
+		{Name: "shorebird", Run: checkShorebird, Fix: installShorebird,
+			Modifies: "global Dart packages (dart pub global activate shorebird_cli)"},
 	}
 }
 
 // FlutterInitActions returns the checks that `init` can fix.
 func FlutterInitActions() Checklist {
 	return Checklist{
-		{Name: "shorebird.yaml", Run: checkShorebirdYAML, Fix: initShorebirdYAML, FixOn: "init"},
-		{Name: ".airbuild.json", Run: checkAirbuildJSON},
+		{Name: "shorebird.yaml", Run: checkShorebirdYAML, Fix: initShorebirdYAML, Modifies: "shorebird.yaml"},
 	}
+}
+
+func flutterBaseURL() string {
+	return apiURL() + "/api/codepush/flutter"
 }
 
 // --- Flutter checks ---
@@ -67,116 +70,111 @@ func checkShorebird() CheckResult {
 }
 
 func checkShorebirdYAML() CheckResult {
-	if !FileExists("shorebird.yaml") {
+	data, err := os.ReadFile("shorebird.yaml")
+	if err != nil {
 		return Fail("shorebird.yaml", "not found in current directory",
 			"Run `airbuild codepush flutter init` to create it")
 	}
-	// Check for base_url pointing to AirBuild
-	if FileContains("shorebird.yaml", "airbuild.dev") {
-		return Pass("shorebird.yaml", "found, configured for AirBuild")
+	values := yamlTopLevel(string(data))
+	want := flutterBaseURL()
+	if values["base_url"] != want {
+		return Fail("shorebird.yaml", fmt.Sprintf("base_url is %q, expected %q", values["base_url"], want),
+			"Run `airbuild codepush flutter init` to point it at AirBuild")
 	}
-	return Warn("shorebird.yaml", "found but may not point to AirBuild",
-		"Add `base_url: https://airbuild.dev` to shorebird.yaml, or run `airbuild codepush flutter init`")
-}
-
-func checkAirbuildJSON() CheckResult {
-	if !project.Exists() {
-		return Fail(".airbuild.json", "not found",
-			"Run `airbuild init` to link your app")
+	if values["distribution_key"] == "" {
+		return Fail("shorebird.yaml", "distribution_key is missing",
+			"Run `airbuild codepush flutter init` to add it")
 	}
-	cfg, err := project.Load()
-	if err != nil {
-		return Fail(".airbuild.json", fmt.Sprintf("invalid: %v", err),
-			"Run `airbuild init` to recreate it")
+	if values["app_id"] == "" {
+		return Warn("shorebird.yaml", "app_id is missing",
+			"Run `airbuild codepush flutter init` to add it")
 	}
-	return Passf(".airbuild.json", "found (app: %s)", cfg.AppID)
-}
-
-func checkAPIKey() CheckResult {
-	cfg, err := config.Load()
-	if err != nil || !cfg.IsLoggedIn() {
-		return Fail("api key", "not configured",
-			"Run `airbuild login --api-key airbuild_xxx`")
-	}
-	return Passf("api key", "configured (%s)", cfg.APIURL)
-}
-
-func checkConnectivity() CheckResult {
-	cfg, err := config.Load()
-	if err != nil {
-		return Fail("connectivity", "could not load config", "")
-	}
-	url := cfg.APIURL + "/api/health"
-	if !FileExists("/dev/null") { // sanity check we're on a real OS
-		return Warn("connectivity", "skipped", "")
-	}
-	// Simple check — just verify the URL is set
-	if cfg.APIURL == "" {
-		return Fail("connectivity", "API URL not configured",
-			"Run `airbuild config set --api-url https://airbuild.dev`")
-	}
-	_ = url // used in future for actual connectivity check
-	return Passf("connectivity", "target: %s", cfg.APIURL)
+	return Pass("shorebird.yaml", "configured for AirBuild")
 }
 
 // --- Flutter fix actions ---
 
 func installShorebird() error {
-	fmt.Println("Installing Shorebird CLI...")
 	if err := RunCmd(".", "dart", "pub", "global", "activate", "shorebird_cli"); err != nil {
 		return fmt.Errorf("failed to install shorebird_cli: %w", err)
 	}
 	return nil
 }
 
+// initShorebirdYAML creates or updates shorebird.yaml so the Shorebird
+// updater checks AirBuild. Existing keys other than base_url and
+// distribution_key are preserved; app_id is only added when missing.
 func initShorebirdYAML() error {
-	if FileExists("shorebird.yaml") {
-		// Check if base_url is already set
-		if FileContains("shorebird.yaml", "airbuild.dev") {
-			fmt.Println("shorebird.yaml already configured for AirBuild")
-			return nil
-		}
-		// Append base_url to existing file
-		return appendBaseURLToShorebirdYAML()
+	dk, err := distributionKey()
+	if err != nil {
+		return err
 	}
-	// Create a minimal shorebird.yaml with base_url
-	return createShorebirdYAML()
-}
+	proj, err := project.Load()
+	if err != nil {
+		return fmt.Errorf("no linked app — run `airbuild init` first")
+	}
 
-func createShorebirdYAML() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+	existing := ""
+	if data, err := os.ReadFile("shorebird.yaml"); err == nil {
+		existing = string(data)
+	} else {
+		existing = "# Shorebird configuration for AirBuild CodePush.\n" +
+			"# base_url points the Shorebird updater at AirBuild instead of Shorebird's cloud.\n"
 	}
-	content := fmt.Sprintf(`# Shorebird configuration for AirBuild CodePush
-# https://shorebird.dev
-# The base_url tells the Shorebird updater to check AirBuild (not Shorebird's cloud).
-base_url: %s
-`, cfg.APIURL)
-	if err := os.WriteFile("shorebird.yaml", []byte(content), 0644); err != nil {
-		return fmt.Errorf("could not create shorebird.yaml: %w", err)
-	}
-	fmt.Println("Created shorebird.yaml with AirBuild base_url")
-	return nil
-}
 
-func appendBaseURLToShorebirdYAML() error {
-	data, err := os.ReadFile("shorebird.yaml")
-	if err != nil {
-		return err
+	updated := existing
+	if yamlTopLevel(updated)["app_id"] == "" {
+		updated = yamlUpsert(updated, "app_id", proj.AppID)
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+	updated = yamlUpsert(updated, "base_url", flutterBaseURL())
+	updated = yamlUpsert(updated, "distribution_key", dk)
+	if yamlTopLevel(updated)["channel"] == "" {
+		updated = yamlUpsert(updated, "channel", "production")
 	}
-	if strings.Contains(string(data), "base_url") {
-		fmt.Println("shorebird.yaml already has base_url configured")
-		return nil
+	// Matches the dashboard's integration snippet — enables auto-apply of
+	// downloaded patches by the Shorebird updater.
+	if yamlTopLevel(updated)["auto_update"] == "" {
+		updated = yamlUpsert(updated, "auto_update", "true")
 	}
-	updated := string(data) + fmt.Sprintf("\nbase_url: %s\n", cfg.APIURL)
+
 	if err := os.WriteFile("shorebird.yaml", []byte(updated), 0644); err != nil {
-		return fmt.Errorf("could not update shorebird.yaml: %w", err)
+		return fmt.Errorf("could not write shorebird.yaml: %w", err)
 	}
-	fmt.Println("Added base_url to shorebird.yaml")
 	return nil
+}
+
+// yamlTopLevel extracts simple top-level `key: value` scalars from a YAML
+// document. Nested structures and multi-line values are ignored, which is
+// sufficient for shorebird.yaml's flat schema.
+func yamlTopLevel(doc string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(doc, "\n") {
+		if line == "" || line[0] == ' ' || line[0] == '\t' || line[0] == '#' {
+			continue
+		}
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if i := strings.Index(v, " #"); i >= 0 {
+			v = v[:i]
+		}
+		out[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"'`)
+	}
+	return out
+}
+
+// yamlUpsert replaces a top-level `key: value` line, or appends it.
+func yamlUpsert(doc, key, value string) string {
+	lines := strings.Split(doc, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, key+":") {
+			lines[i] = fmt.Sprintf("%s: %s", key, value)
+			return strings.Join(lines, "\n")
+		}
+	}
+	if doc != "" && !strings.HasSuffix(doc, "\n") {
+		doc += "\n"
+	}
+	return doc + fmt.Sprintf("%s: %s\n", key, value)
 }
