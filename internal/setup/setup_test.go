@@ -254,7 +254,7 @@ func TestCheckShorebirdYAMLMissing(t *testing.T) {
 
 func TestCheckShorebirdYAMLComplete(t *testing.T) {
 	chdir(t)
-	writeFile(t, "shorebird.yaml", "app_id: abc\nbase_url: https://airbuild.dev/api/codepush/flutter\ndistribution_key: dk_1\nchannel: production\nauto_update: true\n")
+	writeFile(t, "shorebird.yaml", "app_id: abc\nbase_url: https://airbuild.dev\ndistribution_key: dk_1\nchannel: production\nauto_update: true\n")
 	if r := checkShorebirdYAML(); r.Status != StatusPass {
 		t.Fatalf("expected pass, got %v (%s)", r.Status, r.Message)
 	}

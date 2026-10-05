@@ -36,8 +36,12 @@ func FlutterInitActions() Checklist {
 	}
 }
 
+// flutterBaseURL returns the base_url written to shorebird.yaml. The
+// Shorebird updater appends /api/v1/patches/check (and /api/v1/patches/events)
+// to it, so the canonical value is the bare API origin — matching how
+// Shorebird's own api.shorebird.dev is used.
 func flutterBaseURL() string {
-	return apiURL() + "/api/codepush/flutter"
+	return apiURL()
 }
 
 // --- Flutter checks ---
@@ -76,8 +80,12 @@ func checkShorebirdYAML() CheckResult {
 			"Run `airbuild codepush flutter init` to create it")
 	}
 	values := yamlTopLevel(string(data))
+	// Canonical base_url is the bare API origin (the updater appends
+	// /api/v1/patches/check). The legacy /api/codepush/flutter suffix still
+	// works — the server mounts compat routes for it — so accept either.
 	want := flutterBaseURL()
-	if values["base_url"] != want {
+	legacy := want + "/api/codepush/flutter"
+	if values["base_url"] != want && values["base_url"] != legacy {
 		return Fail("shorebird.yaml", fmt.Sprintf("base_url is %q, expected %q", values["base_url"], want),
 			"Run `airbuild codepush flutter init` to point it at AirBuild")
 	}
