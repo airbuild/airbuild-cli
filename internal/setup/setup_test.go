@@ -276,11 +276,161 @@ func TestCheckShorebirdYAMLMissingKey(t *testing.T) {
 	}
 }
 
+// --- checkPubspecAssets / fixPubspecAssets ---
+
+func TestCheckPubspecAssetsMissingFile(t *testing.T) {
+	chdir(t)
+	if r := checkPubspecAssets(); r.Status != StatusFail {
+		t.Fatalf("expected fail, got %v", r.Status)
+	}
+}
+
+func TestCheckPubspecAssetsNotBundled(t *testing.T) {
+	chdir(t)
+	writeFile(t, "pubspec.yaml", "name: app\nflutter:\n  uses-material-design: true\n")
+	if r := checkPubspecAssets(); r.Status != StatusFail {
+		t.Fatalf("expected fail, got %v (%s)", r.Status, r.Message)
+	}
+}
+
+func TestCheckPubspecAssetsBundled(t *testing.T) {
+	chdir(t)
+	writeFile(t, "pubspec.yaml", "name: app\nflutter:\n  uses-material-design: true\n  assets:\n    - shorebird.yaml\n")
+	if r := checkPubspecAssets(); r.Status != StatusPass {
+		t.Fatalf("expected pass, got %v (%s)", r.Status, r.Message)
+	}
+}
+
+func TestFixPubspecAssetsAddsAssetsKey(t *testing.T) {
+	chdir(t)
+	writeFile(t, "pubspec.yaml", "name: app\n\nflutter:\n  uses-material-design: true\n")
+	if err := fixPubspecAssets(); err != nil {
+		t.Fatalf("fixPubspecAssets: %v", err)
+	}
+	data, _ := os.ReadFile("pubspec.yaml")
+	s := string(data)
+	if !strings.Contains(s, "  assets:\n    - shorebird.yaml") {
+		t.Fatalf("asset not added under flutter:assets:\n%s", s)
+	}
+	if !strings.Contains(s, "uses-material-design: true") {
+		t.Fatalf("existing keys disturbed:\n%s", s)
+	}
+	if r := checkPubspecAssets(); r.Status != StatusPass {
+		t.Fatalf("check should pass after fix, got %v", r.Status)
+	}
+}
+
+func TestFixPubspecAssetsAppendsToExistingAssets(t *testing.T) {
+	chdir(t)
+	writeFile(t, "pubspec.yaml", "name: app\nflutter:\n  assets:\n    - images/logo.png\n")
+	if err := fixPubspecAssets(); err != nil {
+		t.Fatalf("fixPubspecAssets: %v", err)
+	}
+	data, _ := os.ReadFile("pubspec.yaml")
+	s := string(data)
+	if !strings.Contains(s, "- images/logo.png") || !strings.Contains(s, "- shorebird.yaml") {
+		t.Fatalf("assets list not preserved/extended:\n%s", s)
+	}
+}
+
+func TestFixPubspecAssetsNoFlutterSection(t *testing.T) {
+	chdir(t)
+	writeFile(t, "pubspec.yaml", "name: app\n")
+	if err := fixPubspecAssets(); err != nil {
+		t.Fatalf("fixPubspecAssets: %v", err)
+	}
+	if r := checkPubspecAssets(); r.Status != StatusPass {
+		t.Fatalf("check should pass after fix, got %v", r.Status)
+	}
+}
+
+func TestFixPubspecAssetsIgnoresNestedFlutter(t *testing.T) {
+	chdir(t)
+	// A non-top-level "flutter:" (e.g. inside a comment-free nested map)
+	// must not be treated as the flutter section.
+	writeFile(t, "pubspec.yaml", "name: app\nfoo:\n  flutter: true\nflutter:\n  uses-material-design: true\n")
+	if err := fixPubspecAssets(); err != nil {
+		t.Fatalf("fixPubspecAssets: %v", err)
+	}
+	data, _ := os.ReadFile("pubspec.yaml")
+	s := string(data)
+	// The asset must land under the real top-level flutter: section.
+	idx := strings.LastIndex(s, "flutter:")
+	if idx < 0 || !strings.Contains(s[idx:], "- shorebird.yaml") {
+		t.Fatalf("asset added to wrong section:\n%s", s)
+	}
+}
+
 // --- checkAPIKey ---
 
 func TestCheckAPIKeyFailsWhenNotLoggedIn(t *testing.T) {
 	chdir(t) // empty HOME → no ~/.airbuild/config.json
 	if r := checkAPIKey(); r.Status != StatusFail {
 		t.Fatalf("expected fail, got %v", r.Status)
+	}
+}
+
+// --- checkInternetPermission / fixInternetPermission ---
+
+func writeManifest(t *testing.T, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(androidManifestPath), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, androidManifestPath, content)
+}
+
+func TestCheckInternetPermissionMissingFile(t *testing.T) {
+	chdir(t)
+	if r := checkInternetPermission(); r.Status != StatusWarn {
+		t.Fatalf("expected warn, got %v (%s)", r.Status, r.Message)
+	}
+}
+
+func TestCheckInternetPermissionAbsent(t *testing.T) {
+	chdir(t)
+	writeManifest(t, "<manifest xmlns:android=\"x\">\n    <application/>\n</manifest>\n")
+	if r := checkInternetPermission(); r.Status != StatusFail {
+		t.Fatalf("expected fail, got %v (%s)", r.Status, r.Message)
+	}
+}
+
+func TestCheckInternetPermissionPresent(t *testing.T) {
+	chdir(t)
+	writeManifest(t, "<manifest xmlns:android=\"x\">\n    <uses-permission android:name=\"android.permission.INTERNET\"/>\n    <application/>\n</manifest>\n")
+	if r := checkInternetPermission(); r.Status != StatusPass {
+		t.Fatalf("expected pass, got %v (%s)", r.Status, r.Message)
+	}
+}
+
+func TestFixInternetPermissionInsertsUsesPermission(t *testing.T) {
+	chdir(t)
+	writeManifest(t, "<manifest xmlns:android=\"x\">\n    <application\n        android:label=\"app\">\n    </application>\n</manifest>\n")
+	if err := fixInternetPermission(); err != nil {
+		t.Fatalf("fixInternetPermission: %v", err)
+	}
+	data, _ := os.ReadFile(androidManifestPath)
+	s := string(data)
+	if !strings.Contains(s, `<uses-permission android:name="android.permission.INTERNET"`) {
+		t.Fatalf("permission not added:\n%s", s)
+	}
+	if !strings.Contains(s, "<application") {
+		t.Fatalf("existing content disturbed:\n%s", s)
+	}
+	if r := checkInternetPermission(); r.Status != StatusPass {
+		t.Fatalf("check should pass after fix, got %v", r.Status)
+	}
+}
+
+func TestFixInternetPermissionIdempotent(t *testing.T) {
+	chdir(t)
+	orig := "<manifest xmlns:android=\"x\">\n    <uses-permission android:name=\"android.permission.INTERNET\"/>\n</manifest>\n"
+	writeManifest(t, orig)
+	if err := fixInternetPermission(); err != nil {
+		t.Fatalf("fixInternetPermission: %v", err)
+	}
+	data, _ := os.ReadFile(androidManifestPath)
+	if string(data) != orig {
+		t.Fatalf("manifest changed on no-op fix:\n%s", string(data))
 	}
 }

@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/airbuild/airbuild-cli/internal/api"
 	"github.com/airbuild/airbuild-cli/internal/expo"
@@ -21,23 +23,24 @@ var codepushCmd = &cobra.Command{
 	Short: "Push OTA code updates (React Native bundles, Flutter patches)",
 }
 
-// codepushFlutterCmd groups the Flutter-specific subcommands, which wrap the
-// (separately installed) Shorebird CLI.
+// codepushFlutterCmd groups the Flutter-specific subcommands, which drive
+// Shorebird's open-source toolchain locally (no Shorebird account needed).
 var codepushFlutterCmd = &cobra.Command{
 	Use:   "flutter",
-	Short: "Flutter CodePush — wraps the Shorebird CLI",
+	Short: "Flutter CodePush — Dart-only OTA patches via Shorebird's updater",
 	Long: `Flutter CodePush pushes Dart-only code patches to your app without a full
 store re-submission, built on Shorebird's open-source updater runtime.
 
 AirBuild is the control plane: it stores releases/patches and decides which
-patch each device receives (channels, staged rollout, rollback). The actual
-build + binary diff is still produced locally by the Shorebird CLI
-(https://pub.dev/packages/shorebird_cli — "dart pub global activate shorebird_cli").
+patch each device receives (channels, staged rollout, rollback). Builds and
+binary diffs are produced locally using Shorebird's bundled Flutter SDK and
+patch tool, installed by ` + "`airbuild codepush flutter install`" + ` — fully
+self-hosted: no Shorebird account, nothing leaves AirBuild.
 
 Typical flow:
   airbuild codepush flutter release android --version 1.0.0+1
   # ...fix a Dart bug...
-  airbuild codepush flutter patch android --release-version 1.0.0+1 --artifact patch.diff
+  airbuild codepush flutter patch android --release-version 1.0.0+1
   airbuild codepush flutter promote --patch 1 --channel production --rollout 25
 
 (If you've run ` + "`airbuild init`" + `, --app is read from .airbuild.json automatically.)`,
@@ -81,11 +84,12 @@ var (
 	cpReleaseNotes           string
 	cpReleaseArtifact        string
 	cpReleaseSkipBuild       bool
+	cpReleaseFormat          string
 )
 
 var codepushFlutterReleaseCmd = &cobra.Command{
 	Use:   "release <android|ios>",
-	Short: "Register a Flutter release (runs `shorebird release`, then uploads the artifact)",
+	Short: "Build a Flutter release locally and register it with AirBuild",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		platformArg := strings.ToLower(args[0])
@@ -104,16 +108,30 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 			ui.Error("--version is required")
 			return
 		}
+		switch cpReleaseFormat {
+		case "apk", "aab", "appbundle":
+		default:
+			ui.Error("--format must be apk or aab, got: %s", cpReleaseFormat)
+			return
+		}
 
 		artifact := cpReleaseArtifact
 		if artifact == "" {
 			if !cpReleaseSkipBuild {
-				if !shorebird.IsInstalled() {
-					ui.Error("shorebird CLI not found on PATH. Install it with `dart pub global activate shorebird_cli`, or pass --artifact to skip the build step.")
+				if platform != "ANDROID" {
+					ui.Error("Local iOS release builds aren't supported yet — pass --artifact <path to built artifact>.")
 					return
 				}
-				ui.Info("Running `shorebird release %s`...", platformArg)
-				if err := shorebird.Run(".", "release", platformArg, "--no-confirm"); err != nil {
+				if _, err := shorebird.BundledFlutter(); err != nil {
+					ui.Error("%v", err)
+					return
+				}
+				target := "apk"
+				if cpReleaseFormat == "aab" || cpReleaseFormat == "appbundle" {
+					target = "appbundle"
+				}
+				ui.Info("Building %s with Shorebird's bundled Flutter (fully local — no Shorebird account needed)...", target)
+				if err := shorebird.RunFlutter(".", nil, "build", target, "--release"); err != nil {
 					ui.Error("%v", err)
 					return
 				}
@@ -126,6 +144,10 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 				}
 				artifact = found
 				ui.Muted("Auto-detected artifact: %s", artifact)
+				// The ABI is the parent dir of libapp.so (e.g. .../arm64-v8a/libapp.so).
+				if cpReleaseArchitecture == "" {
+					cpReleaseArchitecture = filepath.Base(filepath.Dir(artifact))
+				}
 			} else {
 				ui.Error("Auto-detection of the iOS release artifact isn't supported yet — pass --artifact <path to App binary/framework>.")
 				return
@@ -135,6 +157,14 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		if _, err := os.Stat(artifact); err != nil {
 			ui.Error("Artifact not found: %s", artifact)
 			return
+		}
+
+		// Record which bundled Flutter built this release — patches must be
+		// built with the same engine revision.
+		if cpReleaseFlutterRevision == "" {
+			if dir, err := shorebird.FlutterDir(); err == nil {
+				cpReleaseFlutterRevision = filepath.Base(dir)
+			}
 		}
 
 		cfg := mustLoadConfig()
@@ -170,7 +200,8 @@ func init() {
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseShorebirdAppID, "shorebird-app-id", "", "Shorebird app_id, if you're tracking one")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseNotes, "release-notes", "", "Release notes")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseArtifact, "artifact", "", "Path to the built libapp.so / release artifact (skips auto-detection)")
-	codepushFlutterReleaseCmd.Flags().BoolVar(&cpReleaseSkipBuild, "skip-build", false, "Don't run `shorebird release` — just upload --artifact")
+	codepushFlutterReleaseCmd.Flags().BoolVar(&cpReleaseSkipBuild, "skip-build", false, "Don't build — just upload --artifact or auto-detected output")
+	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseFormat, "format", "apk", "Android build format: apk (install links) or aab (Play Store)")
 	codepushFlutterCmd.AddCommand(codepushFlutterReleaseCmd)
 }
 
@@ -183,6 +214,7 @@ var (
 	cpPatchChannel        string
 	cpPatchNotes          string
 	cpPatchArtifact       string
+	cpPatchArtifactHash   string
 	cpPatchSkipBuild      bool
 )
 
@@ -209,64 +241,41 @@ var codepushFlutterPatchCmd = &cobra.Command{
 		}
 
 		artifact := cpPatchArtifact
+		artifactHash := cpPatchArtifactHash
 
 		if artifact == "" {
 			// --- Auto-diff flow ---
 			// When --artifact is omitted, the CLI builds the patch and
 			// locates the resulting diff automatically.
 			//
-			// Android (Phase 2 — full auto-diff):
-			//   1. Run `shorebird patch android --dry-run` (builds libapp.so)
+			// Android auto-diff:
+			//   1. Build libapp.so with Shorebird's bundled Flutter (a patch
+			//      is just the same release build with new Dart code — the
+			//      updater ships the binary diff, not a build recipe).
 			//   2. Locate the freshly built libapp.so via FindAndroidLibapp
 			//   3. Download the release's original libapp.so from AirBuild
-			//   4. Use Shorebird's cached `patch` binary to create the diff
+			//   4. Use Shorebird's `patch` binary (public artifact download)
+			//      to create the bidiff+zstd diff
 			//   5. Upload the diff to AirBuild
-			//
-			// iOS (Phase 1 — temp dir scan):
-			//   1. Record the current timestamp
-			//   2. Run `shorebird patch ios --dry-run` (builds + creates diff
-			//      in a random temp dir, but doesn't upload to Shorebird)
-			//   3. Scan the OS temp dir for a recently-created diff.patch
-			//   4. Upload the located diff to AirBuild
-			//
-			// iOS Phase 1 is best-effort: Shorebird creates the diff in a
-			// random temp directory, so we locate it by scanning for files
-			// named "diff.patch" modified after the build started. If the
-			// scan fails (temp cleanup, concurrent builds), the user falls
-			// back to --artifact.
 
-			if !shorebird.IsInstalled() {
-				ui.Error("shorebird CLI not found on PATH. Install it with `dart pub global activate shorebird_cli`, or pass --artifact to skip the build step.")
+			if _, err := shorebird.BundledFlutter(); err != nil {
+				ui.Error("%v", err)
 				return
 			}
 
 			if platform == "ANDROID" {
-				artifact, err = runAndroidAutoDiff(platformArg, cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchArchitecture, cpPatchChannel, cpPatchAppID)
+				artifact, artifactHash, err = runAndroidAutoDiff(cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchArchitecture, cpPatchChannel, cpPatchAppID)
 				if err != nil {
 					ui.Error("%v", err)
 					return
 				}
 			} else {
-				// iOS — Phase 1: temp dir scan.
-				artifact, err = runIOSAutoDiff(platformArg, cpPatchReleaseVersion, cpPatchSkipBuild)
-				if err != nil {
-					ui.Error(`%v
-
-Could not auto-locate the iOS patch diff. You can still create a patch
-manually:
-  1. Run "shorebird patch ios" yourself
-  2. Locate the resulting diff.patch file
-  3. Pass it via --artifact`, err)
-					return
-				}
-			}
-		} else {
-			// --- Explicit --artifact flow (original behavior) ---
-			if !cpPatchSkipBuild && shorebird.IsInstalled() {
-				ui.Info("Running `shorebird patch %s`...", platformArg)
-				if err := shorebird.Run(".", "patch", platformArg, "--no-confirm"); err != nil {
-					ui.Warn("shorebird patch reported an error (continuing with --artifact anyway): %v", err)
-				}
+				ui.Error(`iOS auto-diff isn't supported yet — iOS patches need aot_tools + analyze_snapshot.
+You can still create a patch manually:
+  1. Build the iOS patch artifact yourself
+  2. Produce the diff.patch file
+  3. Pass it via --artifact`)
+				return
 			}
 		}
 
@@ -275,12 +284,19 @@ manually:
 			return
 		}
 
+		if artifactHash == "" {
+			// Without the patched-artifact hash the server can't send a
+			// `hash` the updater accepts — devices will download the patch
+			// then reject it ("Update rejected: hash mismatch").
+			ui.Muted("No patched-artifact hash supplied — pass --artifact-sha256 (sha256 of the new libapp.so) or use auto-diff.")
+		}
+
 		cfg := mustLoadConfig()
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		ui.Info("Uploading patch...")
 		resp, err := client.CodePushFlutterPatch(
-			artifact, cpPatchAppID, platform, cpPatchReleaseVersion, cpPatchArchitecture, cpPatchChannel, cpPatchNotes,
+			artifact, cpPatchAppID, platform, cpPatchReleaseVersion, cpPatchArchitecture, cpPatchChannel, cpPatchNotes, artifactHash,
 		)
 		if err != nil {
 			ui.Error("Failed to create patch: %v", err)
@@ -288,6 +304,10 @@ manually:
 		}
 
 		ui.Success("Patch #%d created (DRAFT, 0%% rollout)", resp.Update.PatchNumber)
+		// Auto-generated diffs are temp files — clean up after upload.
+		if cpPatchArtifact == "" {
+			os.Remove(artifact) //nolint:errcheck
+		}
 		ui.Info("Promote it with: airbuild codepush flutter promote --patch %d --channel %s --rollout 25",
 			resp.Update.PatchNumber, valueOr(cpPatchChannel, "production"))
 	},
@@ -300,7 +320,8 @@ func init() {
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchChannel, "channel", "production", "Distribution channel")
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchNotes, "release-notes", "", "Patch notes")
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchArtifact, "artifact", "", "Path to a pre-built patch diff file (optional — auto-diffs if omitted)")
-	codepushFlutterPatchCmd.Flags().BoolVar(&cpPatchSkipBuild, "skip-build", false, "Don't run `shorebird patch` — use existing build output or --artifact")
+	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchArtifactHash, "artifact-sha256", "", "sha256 of the patched libapp.so (required when passing --artifact so devices can verify the applied patch)")
+	codepushFlutterPatchCmd.Flags().BoolVar(&cpPatchSkipBuild, "skip-build", false, "Don't rebuild — diff from the existing build output")
 	codepushFlutterCmd.AddCommand(codepushFlutterPatchCmd)
 }
 
@@ -819,35 +840,34 @@ func validateRolloutPercent(pct int) error {
 	return nil
 }
 
-// runAndroidAutoDiff implements the full Android auto-diff flow (Phase 2):
-// build via shorebird patch --dry-run, locate libapp.so, download the release
-// libapp.so from AirBuild, and create the diff using Shorebird's cached
-// patch binary. Returns the path to the generated diff file.
-func runAndroidAutoDiff(platformArg, releaseVersion string, skipBuild bool, architecture, channel, appID string) (string, error) {
-	// Step 1: Build the patch's libapp.so (dry-run = build but don't upload
-	// to Shorebird's cloud).
+// runAndroidAutoDiff implements the full Android auto-diff flow: rebuild
+// libapp.so with Shorebird's bundled Flutter, download the release's
+// libapp.so from AirBuild, and create the diff using Shorebird's `patch`
+// binary. Returns the path to the generated diff file and the sha256 of
+// the patched libapp.so — the artifact hash the on-device updater
+// verifies after applying the diff.
+func runAndroidAutoDiff(releaseVersion string, skipBuild bool, architecture, channel, appID string) (string, string, error) {
+	// Step 1: Build the patch's libapp.so — the same release build with the
+	// new Dart code, using the bundled (updater-capable) Flutter SDK.
 	if !skipBuild {
-		ui.Info("Running `shorebird patch %s --dry-run` (building patch artifact)...", platformArg)
-		releaseVersionArgs := []string{"patch", platformArg, "--dry-run"}
-		if releaseVersion != "" {
-			releaseVersionArgs = append(releaseVersionArgs, "--release-version", releaseVersion)
-		}
-		if err := shorebird.Run(".", releaseVersionArgs...); err != nil {
-			return "", fmt.Errorf("shorebird patch --dry-run failed: %w", err)
+		ui.Info("Building patch artifact with Shorebird's bundled Flutter...")
+		if err := shorebird.RunFlutter(".", nil, "build", "apk", "--release"); err != nil {
+			return "", "", fmt.Errorf("patch build failed: %w", err)
 		}
 	}
 
 	// Step 2: Locate the freshly built patch libapp.so.
 	patchLibapp, err := shorebird.FindAndroidLibapp(".", architecture)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	ui.Muted("Found patch libapp.so: %s", patchLibapp)
 
-	// Step 3: Locate Shorebird's cached `patch` binary (for diffing).
-	patchBinary, err := shorebird.FindPatchBinary()
+	// Step 3: Locate Shorebird's `patch` binary (downloads it from
+	// Shorebird's public artifact bucket on first use — no auth needed).
+	patchBinary, err := shorebird.EnsurePatchBinary()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	ui.Muted("Using Shorebird patch binary: %s", patchBinary)
 
@@ -860,84 +880,61 @@ func runAndroidAutoDiff(platformArg, releaseVersion string, skipBuild bool, arch
 		appID, releaseVersion, "ANDROID", architecture, channel,
 	)
 	if err != nil {
-		return "", fmt.Errorf("failed to get release download URL: %w", err)
+		return "", "", fmt.Errorf("failed to get release download URL: %w", err)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "airbuild-patch-*")
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp directory: %w", err)
+		return "", "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 	defer os.RemoveAll(tmpDir) //nolint:errcheck
 
 	releaseLibappPath := filepath.Join(tmpDir, "release-libapp.so")
 	if err := client.DownloadFile(dlResp.DownloadUrl, releaseLibappPath); err != nil {
-		return "", fmt.Errorf("failed to download release libapp.so: %w", err)
+		return "", "", fmt.Errorf("failed to download release libapp.so: %w", err)
 	}
 	ui.Muted("Downloaded release libapp.so (%s) to %s", dlResp.Release.Version, releaseLibappPath)
 
-	// Step 5: Create the binary diff using Shorebird's patch binary.
-	diffPath := filepath.Join(tmpDir, "patch.diff")
+	// Step 5: Create the binary diff using Shorebird's patch binary. The
+	// diff goes in its own temp file (not tmpDir — that's deleted on
+	// return, and the caller needs the path to survive for the upload).
+	diffFile, err := os.CreateTemp("", "airbuild-patch-*.diff")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create diff file: %w", err)
+	}
+	diffPath := diffFile.Name()
+	diffFile.Close() //nolint:errcheck
 	ui.Info("Creating binary diff...")
 	if err := shorebird.CreateDiff(patchBinary, releaseLibappPath, patchLibapp, diffPath); err != nil {
-		return "", fmt.Errorf("failed to create diff: %w", err)
+		return "", "", fmt.Errorf("failed to create diff: %w", err)
 	}
 	if err := shorebird.ValidateDiffFile(diffPath); err != nil {
-		return "", fmt.Errorf("generated diff failed validation: %w", err)
+		return "", "", fmt.Errorf("generated diff failed validation: %w", err)
+	}
+
+	// The updater verifies the *patched artifact* hash (the new libapp.so)
+	// after applying the diff — send it alongside the upload.
+	artifactHash, err := sha256File(patchLibapp)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to hash patch artifact: %w", err)
 	}
 
 	ui.Muted("Created diff: %s", diffPath)
-	return diffPath, nil
+	return diffPath, artifactHash, nil
 }
 
-// runIOSAutoDiff implements the iOS Phase 1 auto-diff flow: run
-// `shorebird patch ios --dry-run`, then scan the OS temp directory for the
-// diff.patch file that Shorebird creates in a random temp dir. This is
-// best-effort — if the scan fails, the user falls back to --artifact.
-//
-// Full Phase 2 (driving aot_tools + analyze_snapshot + patch directly) was
-// investigated and deliberately deferred: Shorebird's aot_tools is not a
-// stable standalone binary — recent versions distribute it as a compiled
-// Dart kernel (.dill) invoked via Shorebird's own bundled `dart run`, with
-// cache paths resolved by internal, version-dependent logic. Hand-rolling
-// that is high-risk for a production OTA tool (a subtly wrong diff base
-// would produce a patch that corrupts or crashes the app on real devices,
-// rather than failing loudly). See docs/CHECKLIST.md §5.2d for the full
-// research writeup and re-evaluation criteria.
-func runIOSAutoDiff(platformArg, releaseVersion string, skipBuild bool) (string, error) {
-	// Record the timestamp before building so we can filter temp files.
-	buildStart := time.Now()
-
-	if !skipBuild {
-		ui.Info("Running `shorebird patch %s --dry-run` (building + creating diff)...", platformArg)
-		releaseVersionArgs := []string{"patch", platformArg, "--dry-run"}
-		if releaseVersion != "" {
-			releaseVersionArgs = append(releaseVersionArgs, "--release-version", releaseVersion)
-		}
-		if err := shorebird.Run(".", releaseVersionArgs...); err != nil {
-			return "", fmt.Errorf("shorebird patch --dry-run failed: %w", err)
-		}
-	}
-
-	// Scan the OS temp dir for a diff.patch modified after buildStart.
-	ui.Info("Scanning temp directory for the generated diff...")
-	result, err := shorebird.FindRecentDiffPatch(buildStart)
+// sha256File returns the lowercase hex sha256 of a file's contents.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	if len(result.AmbiguousMatches) > 0 {
-		ui.Warn("Found %d other diff.patch file(s) created around the same time — picked the most recent one (%s). If this is wrong, pass --artifact explicitly:",
-			len(result.AmbiguousMatches), result.Path)
-		for _, m := range result.AmbiguousMatches {
-			ui.Warn("  - %s", m)
-		}
+	defer f.Close() //nolint:errcheck
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
 	}
-
-	if err := shorebird.ValidateDiffFile(result.Path); err != nil {
-		return "", fmt.Errorf("%w (this can happen if the temp-dir scan picked up a stale or unrelated file)", err)
-	}
-
-	ui.Muted("Found diff: %s", result.Path)
-	return result.Path, nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func valueOr(v, fallback string) string {

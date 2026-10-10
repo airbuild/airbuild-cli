@@ -21,26 +21,325 @@
 package shorebird
 
 import (
+	"archive/zip"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 )
 
-// IsInstalled reports whether the `shorebird` binary is on PATH.
+// InstallDir returns the directory the official Shorebird installer uses:
+// $XDG_CONFIG_HOME/shorebird when set, otherwise ~/.shorebird.
+func InstallDir() (string, error) {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "shorebird"), nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not determine home directory: %w", err)
+	}
+	return filepath.Join(homeDir, ".shorebird"), nil
+}
+
+// binaryName matches Shorebird's own naming: a shell script on Unix, a
+// batch file on Windows.
+func binaryName() string {
+	if runtime.GOOS == "windows" {
+		return "shorebird.bat"
+	}
+	return "shorebird"
+}
+
+// DefaultBinary returns the shorebird binary inside InstallDir if it
+// exists there, regardless of PATH. Returns "" when Shorebird isn't
+// installed at the default location.
+func DefaultBinary() string {
+	dir, err := InstallDir()
+	if err != nil {
+		return ""
+	}
+	candidate := filepath.Join(dir, "bin", binaryName())
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return ""
+}
+
+// BinaryPath resolves the shorebird executable: first on PATH, then the
+// default install location. The PATH fallback lets airbuild drive the
+// CLI right after `codepush flutter install`, before the user restarts
+// their shell to pick up the updated PATH.
+func BinaryPath() (string, error) {
+	if p, err := exec.LookPath("shorebird"); err == nil {
+		return p, nil
+	}
+	if p := DefaultBinary(); p != "" {
+		return p, nil
+	}
+	return "", fmt.Errorf("shorebird CLI not found — run `airbuild codepush flutter install`")
+}
+
+// IsInstalled reports whether the `shorebird` binary is on PATH or in the
+// default install location.
 func IsInstalled() bool {
-	_, err := exec.LookPath("shorebird")
+	_, err := BinaryPath()
 	return err == nil
+}
+
+// --- Bundled Flutter toolchain ---
+//
+// Shorebird's releases are plain `flutter build` invocations run with
+// Shorebird's own Flutter SDK — a fork whose engine has the updater
+// runtime compiled in. Everything server-side (release metadata, artifact
+// hosting, rollout decisions) is AirBuild's job, so airbuild drives the
+// bundled SDK directly instead of `shorebird release`/`shorebird patch`,
+// which require a Shorebird cloud account and backend. This keeps the
+// whole flow self-hosted: no Shorebird login, no data leaving AirBuild.
+
+// FlutterDir returns the Shorebird-managed Flutter SDK directory to build
+// with: <install>/bin/cache/flutter/<revision>. When several revisions are
+// cached it prefers the one named by SHOREBIRD_FLUTTER_REVISION or the
+// project's shorebird.yaml flutter_revision, then falls back to the most
+// recently modified entry.
+func FlutterDir() (string, error) {
+	installDir, err := InstallDir()
+	if err != nil {
+		return "", err
+	}
+	cacheDir := filepath.Join(installDir, "bin", "cache", "flutter")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return "", fmt.Errorf("no Shorebird Flutter SDK found at %s — run `airbuild codepush flutter install`", cacheDir)
+	}
+	var dirs []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e)
+		}
+	}
+	if len(dirs) == 0 {
+		return "", fmt.Errorf("no Shorebird Flutter SDK found at %s — run `airbuild codepush flutter install`", cacheDir)
+	}
+	if want := preferredFlutterRevision(); want != "" {
+		for _, d := range dirs {
+			if d.Name() == want {
+				return filepath.Join(cacheDir, want), nil
+			}
+		}
+	}
+	// Most recently modified revision dir wins.
+	sort.Slice(dirs, func(i, j int) bool {
+		fi, _ := dirs[i].Info()
+		fj, _ := dirs[j].Info()
+		return fi.ModTime().After(fj.ModTime())
+	})
+	return filepath.Join(cacheDir, dirs[0].Name()), nil
+}
+
+// preferredFlutterRevision reads SHOREBIRD_FLUTTER_REVISION, then
+// shorebird.yaml's flutter_revision in the current directory.
+func preferredFlutterRevision() string {
+	if rev := strings.TrimSpace(os.Getenv("SHOREBIRD_FLUTTER_REVISION")); rev != "" {
+		return rev
+	}
+	if data, err := os.ReadFile("shorebird.yaml"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "flutter_revision:") {
+				return strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "flutter_revision:")), `"'`)
+			}
+		}
+	}
+	return ""
+}
+
+// BundledFlutter returns the path to Shorebird's bundled `flutter` binary.
+func BundledFlutter() (string, error) {
+	dir, err := FlutterDir()
+	if err != nil {
+		return "", err
+	}
+	bin := filepath.Join(dir, "bin", "flutter")
+	if runtime.GOOS == "windows" {
+		bin += ".bat"
+	}
+	if _, err := os.Stat(bin); err != nil {
+		return "", fmt.Errorf("bundled Flutter binary not found at %s — run `airbuild codepush flutter install`", bin)
+	}
+	return bin, nil
+}
+
+// EngineRevision reads the Shorebird engine revision from the bundled
+// Flutter SDK (bin/internal/engine.version) — the revision Shorebird uses
+// to name its public artifact downloads (patch binary, aot-tools).
+func EngineRevision() (string, error) {
+	dir, err := FlutterDir()
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "bin", "internal", "engine.version"))
+	if err != nil {
+		return "", fmt.Errorf("could not read engine.version: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// RunFlutter runs Shorebird's bundled `flutter <args...>` in dir with
+// output streamed through, then best-effort restores the project's
+// package_config.json to the system Flutter (mirroring what the Shorebird
+// CLI does after builds so the IDE isn't left pointing at the forked SDK).
+func RunFlutter(dir string, env map[string]string, args ...string) error {
+	bin, err := BundledFlutter()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if len(env) > 0 {
+		cmd.Env = os.Environ()
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
+	runErr := cmd.Run()
+
+	// Best-effort: reset .dart_tool/package_config.json to the system
+	// Flutter, like the Shorebird CLI does after every build.
+	if sysFlutter, err := exec.LookPath("flutter"); err == nil {
+		reset := exec.Command(sysFlutter, "--no-version-check", "pub", "get", "--offline")
+		reset.Dir = dir
+		reset.Stdout = io.Discard
+		reset.Stderr = io.Discard
+		_ = reset.Run()
+	}
+
+	if runErr != nil {
+		return fmt.Errorf("flutter %v failed: %w", args, runErr)
+	}
+	return nil
+}
+
+// patchArtifactName maps the host platform to Shorebird's public artifact
+// zip name (e.g. patch-darwin-arm64.zip).
+func patchArtifactName() (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		if runtime.GOARCH == "arm64" {
+			return "patch-darwin-arm64.zip", nil
+		}
+		return "patch-darwin-x64.zip", nil
+	case "linux":
+		return "patch-linux-x64.zip", nil
+	case "windows":
+		return "patch-windows-x64.zip", nil
+	}
+	return "", fmt.Errorf("unsupported platform %s/%s", runtime.GOOS, runtime.GOARCH)
+}
+
+// EnsurePatchBinary locates Shorebird's cached `patch` binary, downloading
+// it from Shorebird's public artifact bucket if it isn't cached yet. The
+// download needs no authentication — the bucket is public; only the
+// Shorebird cloud API requires an account (which airbuild never calls).
+func EnsurePatchBinary() (string, error) {
+	if p, err := FindPatchBinary(); err == nil {
+		return p, nil
+	}
+	engineRev, err := EngineRevision()
+	if err != nil {
+		return "", err
+	}
+	artifact, err := patchArtifactName()
+	if err != nil {
+		return "", err
+	}
+	installDir, err := InstallDir()
+	if err != nil {
+		return "", err
+	}
+	outDir := filepath.Join(installDir, "bin", "cache", "artifacts", "patch")
+	url := fmt.Sprintf("https://storage.googleapis.com/download.shorebird.dev/shorebird/%s/%s", engineRev, artifact)
+	if err := downloadAndUnzip(url, outDir); err != nil {
+		return "", fmt.Errorf("failed to download patch tool: %w", err)
+	}
+	return FindPatchBinary()
+}
+
+// downloadAndUnzip fetches url and extracts the zip into outDir.
+func downloadAndUnzip(url, outDir string) error {
+	resp, err := http.Get(url) //nolint:gosec // fixed shorebird.dev host
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	tmp, err := os.CreateTemp("", "airbuild-artifact-*.zip")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) //nolint:errcheck
+	defer tmp.Close()           //nolint:errcheck
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		return err
+	}
+	zr, err := zip.OpenReader(tmp.Name())
+	if err != nil {
+		return fmt.Errorf("invalid zip: %w", err)
+	}
+	defer zr.Close() //nolint:errcheck
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	for _, f := range zr.File {
+		dest := filepath.Join(outDir, f.Name)
+		// Guard against zip-slip: only extract names that stay under outDir.
+		if !strings.HasPrefix(dest, filepath.Clean(outDir)+string(os.PathSeparator)) && filepath.Clean(dest) != filepath.Clean(outDir) {
+			return fmt.Errorf("unsafe path in zip: %s", f.Name)
+		}
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(dest, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		w, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, f.Mode()|0o111)
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		if _, err := io.Copy(w, rc); err != nil {
+			rc.Close()
+			w.Close()
+			return err
+		}
+		rc.Close()
+		w.Close()
+	}
+	return nil
 }
 
 // Run executes `shorebird <args...>` in dir, streaming output to the
 // current process's stdout/stderr so the user sees Shorebird's own
 // progress output (build logs, prompts, etc).
 func Run(dir string, args ...string) error {
-	cmd := exec.Command("shorebird", args...)
+	bin, err := BinaryPath()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

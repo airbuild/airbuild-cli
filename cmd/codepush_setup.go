@@ -71,7 +71,7 @@ var codepushFlutterInstallCmd = &cobra.Command{
 	Long: `Install missing Flutter CodePush dependencies.
 
 Currently installs:
-  - Shorebird CLI (via 'dart pub global activate shorebird_cli')
+  - Shorebird CLI (clones github.com/shorebirdtech/shorebird to ~/.shorebird)
 
 Requires Dart to be installed first. Asks for confirmation unless --yes is set.`,
 	Run: func(cmd *cobra.Command, args []string) {

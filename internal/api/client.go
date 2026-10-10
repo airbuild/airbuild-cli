@@ -595,8 +595,10 @@ func (c *Client) CodePushFlutterRelease(filePath, appID, platform, version, arch
 }
 
 // CodePushFlutterPatch uploads a Flutter patch (binary diff) against an
-// existing release.
-func (c *Client) CodePushFlutterPatch(filePath, appID, platform, releaseVersion, architecture, channel, releaseNotes string) (*CodePushUpdateResponse, error) {
+// existing release. artifactSha256 is the sha256 of the patched libapp.so
+// — the value devices verify after applying the diff — and may be empty
+// when unknown (the update will then fail device-side verification).
+func (c *Client) CodePushFlutterPatch(filePath, appID, platform, releaseVersion, architecture, channel, releaseNotes, artifactSha256 string) (*CodePushUpdateResponse, error) {
 	data, err := c.codePushMultipartUpload("/api/codepush/flutter/patch", filePath, map[string]string{
 		"appId":          appID,
 		"platform":       platform,
@@ -604,6 +606,7 @@ func (c *Client) CodePushFlutterPatch(filePath, appID, platform, releaseVersion,
 		"architecture":   architecture,
 		"channel":        channel,
 		"releaseNotes":   releaseNotes,
+		"artifactSha256": artifactSha256,
 	})
 	if err != nil {
 		return nil, err
