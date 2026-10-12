@@ -152,3 +152,32 @@ func TestResolveAppIDUsesConfigFileNameConstant(t *testing.T) {
 		t.Errorf("project.ConfigFile = %q, want \".airbuild.json\"", project.ConfigFile)
 	}
 }
+
+func TestDartDefineArgs(t *testing.T) {
+	oldD, oldF := cpDartDefines, cpDartDefineFiles
+	defer func() { cpDartDefines, cpDartDefineFiles = oldD, oldF }()
+
+	cpDartDefines, cpDartDefineFiles = nil, nil
+	if got := dartDefineArgs(); len(got) != 0 {
+		t.Fatalf("expected no args, got %v", got)
+	}
+
+	// Values containing commas must pass through whole (StringArray, not
+	// StringSlice which would split on commas).
+	cpDartDefines = []string{"API_URL=https://x.example.com", "MSG=hello,world"}
+	cpDartDefineFiles = []string{"env.staging.json"}
+	got := dartDefineArgs()
+	want := []string{
+		"--dart-define=API_URL=https://x.example.com",
+		"--dart-define=MSG=hello,world",
+		"--dart-define-from-file=env.staging.json",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}

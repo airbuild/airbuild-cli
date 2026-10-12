@@ -90,6 +90,8 @@ var (
 	cpReleaseSkipBuild       bool
 	cpReleaseNoCodesign      bool
 	cpReleaseFormat          string
+	cpDartDefines            []string
+	cpDartDefineFiles        []string
 )
 
 var codepushFlutterReleaseCmd = &cobra.Command{
@@ -137,7 +139,8 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 						target = "appbundle"
 					}
 					ui.Info("Building %s with Shorebird's bundled Flutter (fully local — no Shorebird account needed)...", target)
-					if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), "build", target, "--release"); err != nil {
+					buildArgs := append([]string{"build", target, "--release"}, dartDefineArgs()...)
+					if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), buildArgs...); err != nil {
 						ui.Error("%v", err)
 						return
 					}
@@ -151,14 +154,16 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 					// installable app (re-signing it later is safe too).
 					if cpReleaseNoCodesign {
 						ui.Info("Building iOS app with Shorebird's bundled Flutter (--no-codesign)...")
-						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), "build", "ios", "--release", "--no-codesign"); err != nil {
+						buildArgs := append([]string{"build", "ios", "--release", "--no-codesign"}, dartDefineArgs()...)
+						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), buildArgs...); err != nil {
 							ui.Error("%v", err)
 							return
 						}
 						ui.Muted("Note: sign/install the .app this build produced — patches can't apply to a separately-built binary.")
 					} else {
 						ui.Info("Building signed iOS app with Shorebird's bundled Flutter...")
-						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), "build", "ios", "--release"); err != nil {
+						buildArgs := append([]string{"build", "ios", "--release"}, dartDefineArgs()...)
+						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), buildArgs...); err != nil {
 							ui.Error("%v", err)
 							return
 						}
@@ -279,6 +284,8 @@ func init() {
 	codepushFlutterReleaseCmd.Flags().BoolVar(&cpReleaseSkipBuild, "skip-build", false, "Don't build — just upload --artifact or auto-detected output")
 	codepushFlutterReleaseCmd.Flags().BoolVar(&cpReleaseNoCodesign, "no-codesign", false, "iOS: build unsigned (for CI where the same .app is signed later — never recompile)")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseFormat, "format", "apk", "Android build format: apk (install links) or aab (Play Store)")
+	codepushFlutterReleaseCmd.Flags().StringArrayVar(&cpDartDefines, "dart-define", nil, "Dart compile-time constant KEY=VALUE (repeatable), passed to flutter build")
+	codepushFlutterReleaseCmd.Flags().StringArrayVar(&cpDartDefineFiles, "dart-define-from-file", nil, "JSON file of dart-define values (repeatable), passed to flutter build")
 	codepushFlutterCmd.AddCommand(codepushFlutterReleaseCmd)
 }
 
@@ -414,6 +421,8 @@ func init() {
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchArtifact, "artifact", "", "Path to a pre-built patch diff file (optional — auto-diffs if omitted)")
 	codepushFlutterPatchCmd.Flags().StringVar(&cpPatchArtifactHash, "artifact-sha256", "", "sha256 of the patched libapp.so (required when passing --artifact so devices can verify the applied patch)")
 	codepushFlutterPatchCmd.Flags().BoolVar(&cpPatchSkipBuild, "skip-build", false, "Don't rebuild — diff from the existing build output")
+	codepushFlutterPatchCmd.Flags().StringArrayVar(&cpDartDefines, "dart-define", nil, "Dart compile-time constant KEY=VALUE (repeatable), passed to flutter build")
+	codepushFlutterPatchCmd.Flags().StringArrayVar(&cpDartDefineFiles, "dart-define-from-file", nil, "JSON file of dart-define values (repeatable), passed to flutter build")
 	codepushFlutterCmd.AddCommand(codepushFlutterPatchCmd)
 }
 
@@ -951,6 +960,19 @@ func patchSigningEnv(appID string) map[string]string {
 	return map[string]string{"SHOREBIRD_PUBLIC_KEY": key.RSAPublicKeyDerBase64}
 }
 
+// dartDefineArgs converts --dart-define / --dart-define-from-file flag
+// values into `flutter build` arguments.
+func dartDefineArgs() []string {
+	var args []string
+	for _, d := range cpDartDefines {
+		args = append(args, "--dart-define="+d)
+	}
+	for _, f := range cpDartDefineFiles {
+		args = append(args, "--dart-define-from-file="+f)
+	}
+	return args
+}
+
 // runAndroidAutoDiff implements the full Android auto-diff flow: rebuild
 // libapp.so with Shorebird's bundled Flutter, download the release's
 // per-architecture libapp.so from AirBuild, and create one binary diff per
@@ -962,7 +984,8 @@ func runAndroidAutoDiff(releaseVersion string, skipBuild bool, architecture, cha
 	// new Dart code, using the bundled (updater-capable) Flutter SDK.
 	if !skipBuild {
 		ui.Info("Building patch artifact with Shorebird's bundled Flutter...")
-		if err := shorebird.RunFlutter(".", patchSigningEnv(appID), "build", "apk", "--release"); err != nil {
+		buildArgs := append([]string{"build", "apk", "--release"}, dartDefineArgs()...)
+		if err := shorebird.RunFlutter(".", patchSigningEnv(appID), buildArgs...); err != nil {
 			return nil, fmt.Errorf("patch build failed: %w", err)
 		}
 	}
@@ -1161,7 +1184,8 @@ func runIOSAutoDiff(releaseVersion string, skipBuild bool, channel, appID string
 	buildStart := time.Now()
 	if !skipBuild {
 		ui.Info("Building iOS patch with Shorebird's bundled Flutter (--no-codesign)...")
-		if err := shorebird.RunFlutter(".", patchSigningEnv(appID), "build", "ios", "--release", "--no-codesign"); err != nil {
+		buildArgs := append([]string{"build", "ios", "--release", "--no-codesign"}, dartDefineArgs()...)
+		if err := shorebird.RunFlutter(".", patchSigningEnv(appID), buildArgs...); err != nil {
 			return "", "", fmt.Errorf("patch build failed: %w", err)
 		}
 		warnNonDartChanges(".", "IOS", releaseVersion)
