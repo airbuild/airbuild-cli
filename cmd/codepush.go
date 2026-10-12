@@ -259,6 +259,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		// --artifact upload may not match the local build dir.
 		if !cpReleaseSkipBuild && cpReleaseArtifact == "" {
 			writeBuildManifest(".", platform, cpReleaseVersion)
+			writeDefinesManifest(".", platform, cpReleaseVersion)
 		}
 
 		ui.Success("Release registered")
@@ -991,7 +992,11 @@ func runAndroidAutoDiff(releaseVersion string, skipBuild bool, architecture, cha
 	}
 
 	// Warn if the patch build contains non-Dart changes the OTA can't ship
-	// (native code, assets, or a different engine revision).
+	// (native code, assets, or a different engine revision), and if the
+	// dart-define constants differ from what the release was built with.
+	if !skipBuild {
+		warnDartDefineDrift(".", "ANDROID", releaseVersion)
+	}
 	warnNonDartChanges(".", "ANDROID", releaseVersion)
 
 	// Step 2: Locate the freshly built patch libapp.so for every packaged
@@ -1188,6 +1193,7 @@ func runIOSAutoDiff(releaseVersion string, skipBuild bool, channel, appID string
 		if err := shorebird.RunFlutter(".", patchSigningEnv(appID), buildArgs...); err != nil {
 			return "", "", fmt.Errorf("patch build failed: %w", err)
 		}
+		warnDartDefineDrift(".", "IOS", releaseVersion)
 		warnNonDartChanges(".", "IOS", releaseVersion)
 	} else {
 		buildStart = time.Time{} // accept any existing app.dill
@@ -1587,5 +1593,136 @@ func warnNonDartChanges(projectDir, platform, releaseVersion string) {
 	}
 	if len(assetChanged) > 0 {
 		show("⚠ Asset files changed since the release — assets are not patchable; they will NOT reach devices:", assetChanged)
+	}
+}
+
+// --- Dart-define drift detection ---
+//
+// --dart-define constants are compiled into libapp.so, so they're part of
+// what a patch ships. A patch built with different defines than the
+// release silently changes (or reverts to fromEnvironment defaults) those
+// constants on every patched device. We record the release's define set —
+// value hashes only, never the values themselves, since defines may carry
+// secrets — and warn when the patch's set differs.
+
+// normalizedDartDefines merges --dart-define KEY=VALUE entries with the
+// contents of --dart-define-from-file files into one map. Later entries
+// override earlier ones, matching flutter's last-wins semantics.
+func normalizedDartDefines() map[string]string {
+	m := map[string]string{}
+	for _, d := range cpDartDefines {
+		if k, v, ok := strings.Cut(d, "="); ok {
+			m[k] = v
+		}
+		// Malformed entries are left for flutter itself to report.
+	}
+	for _, f := range cpDartDefineFiles {
+		mergeDefineFile(f, m)
+	}
+	return m
+}
+
+// mergeDefineFile reads a --dart-define-from-file file — JSON object (the
+// format flutter requires since 3.22), with a dotenv-style KEY=VALUE
+// fallback for newer Flutter versions that also accept .env files.
+func mergeDefineFile(path string, m map[string]string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // let flutter itself report an unreadable file
+	}
+	var fm map[string]string
+	if err := json.Unmarshal(data, &fm); err == nil {
+		for k, v := range fm {
+			m[k] = v
+		}
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			m[strings.TrimSpace(k)] = strings.Trim(v, `"' `+"\t")
+		}
+	}
+}
+
+// hashDefines maps define names to sha256(value) so the manifest never
+// persists secret values.
+func hashDefines(m map[string]string) map[string]string {
+	h := make(map[string]string, len(m))
+	for k, v := range m {
+		sum := sha256.Sum256([]byte(v))
+		h[k] = hex.EncodeToString(sum[:])
+	}
+	return h
+}
+
+func definesManifestPath(projectDir, platform, version string) string {
+	return strings.TrimSuffix(manifestPath(projectDir, platform, version), ".json") + ".defines.json"
+}
+
+func loadDefinesManifest(projectDir, platform, version string) map[string]string {
+	data, err := os.ReadFile(definesManifestPath(projectDir, platform, version))
+	if err != nil {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+// writeDefinesManifest persists the release build's dart-define set
+// (hashed values) for warnDartDefineDrift to compare against at patch time.
+func writeDefinesManifest(projectDir, platform, version string) {
+	m := hashDefines(normalizedDartDefines())
+	path := definesManifestPath(projectDir, platform, version)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+// warnDartDefineDrift compares the release's dart-define set against the
+// current flags and reports adds/removes/changes by key name.
+func warnDartDefineDrift(projectDir, platform, releaseVersion string) {
+	old := loadDefinesManifest(projectDir, platform, releaseVersion)
+	if old == nil {
+		return // release registered elsewhere, or before defines tracking
+	}
+	fresh := hashDefines(normalizedDartDefines())
+
+	var changed []string
+	for k, v := range fresh {
+		if ov, ok := old[k]; !ok {
+			changed = append(changed, "+"+k)
+		} else if ov != v {
+			changed = append(changed, "~"+k)
+		}
+	}
+	for k := range old {
+		if _, ok := fresh[k]; !ok {
+			changed = append(changed, "-"+k)
+		}
+	}
+	if len(changed) == 0 {
+		return
+	}
+	sort.Strings(changed)
+	ui.Error("⚠ dart-define values differ from the release build — patched devices get these constants changed (+added / ~modified / -reverts to default):")
+	const max = 8
+	for i, f := range changed {
+		if i >= max {
+			ui.Muted("    ... and %d more", len(changed)-max)
+			break
+		}
+		ui.Muted("    %s", f)
 	}
 }
