@@ -377,6 +377,101 @@ func FindAndroidLibapp(projectDir, architecture string) (string, error) {
 	return findIntermediateLibapp(projectDir, architecture)
 }
 
+// FindAndroidLibapps extracts libapp.so for EVERY architecture packaged in
+// the built APK/AAB, returning arch-ABI → temp file path. Multi-ABI builds
+// need one release artifact and one patch diff per architecture.
+func FindAndroidLibapps(projectDir string) (map[string]string, error) {
+	outputs := []string{
+		filepath.Join(projectDir, "build", "app", "outputs", "flutter-apk", "app-release.apk"),
+		filepath.Join(projectDir, "build", "app", "outputs", "bundle", "release", "app-release.aab"),
+	}
+	for _, archive := range outputs {
+		if found, err := extractPackagedLibapps(archive); err == nil {
+			return found, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	return findIntermediateLibapps(projectDir)
+}
+
+// extractPackagedLibapps extracts every lib/<abi>/libapp.so entry (AABs
+// nest under base/) into temp files keyed by ABI.
+func extractPackagedLibapps(archivePath string) (map[string]string, error) {
+	if _, err := os.Stat(archivePath); err != nil {
+		return nil, err
+	}
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("could not read %s: %w", archivePath, err)
+	}
+	defer zr.Close() //nolint:errcheck
+
+	out := map[string]string{}
+	for _, f := range zr.File {
+		parts := strings.Split(strings.TrimPrefix(f.Name, "./"), "/")
+		for i, p := range parts {
+			if p == "lib" && i+2 < len(parts) && parts[i+2] == "libapp.so" {
+				abi := parts[i+1]
+				if _, seen := out[abi]; seen {
+					break
+				}
+				rc, err := f.Open()
+				if err != nil {
+					return nil, fmt.Errorf("could not read %s from %s: %w", f.Name, archivePath, err)
+				}
+				tmp, err := os.CreateTemp("", "airbuild-libapp-*.so")
+				if err != nil {
+					rc.Close() //nolint:errcheck
+					return nil, err
+				}
+				if _, err := io.Copy(tmp, rc); err != nil {
+					tmp.Close() //nolint:errcheck
+					rc.Close()  //nolint:errcheck
+					return nil, fmt.Errorf("could not extract libapp.so: %w", err)
+				}
+				tmp.Close() //nolint:errcheck
+				rc.Close()  //nolint:errcheck
+				out[abi] = tmp.Name()
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no packaged libapp.so found in %s — pass --artifact explicitly", archivePath)
+	}
+	return out, nil
+}
+
+// findIntermediateLibapps is the intermediates fallback for
+// FindAndroidLibapps — collects every <abi>/libapp.so under the Gradle
+// native-libs dirs keyed by ABI.
+func findIntermediateLibapps(projectDir string) (map[string]string, error) {
+	candidateRoots := []string{
+		filepath.Join(projectDir, "build", "app", "intermediates", "stripped_native_libs"),
+		filepath.Join(projectDir, "build", "app", "intermediates", "merged_native_libs"),
+	}
+	out := map[string]string{}
+	for _, root := range candidateRoots {
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil //nolint:nilerr — best-effort scan
+			}
+			if filepath.Base(path) == "libapp.so" {
+				out[filepath.Base(filepath.Dir(path))] = path
+			}
+			return nil
+		})
+		if len(out) > 0 {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf(
+		"could not auto-locate libapp.so under %s (Flutter/AGP version differences can move this path) — pass --artifact <path> explicitly",
+		projectDir,
+	)
+}
+
 // extractPackagedLibapp pulls lib/<arch>/libapp.so out of an APK, or
 // base/lib/<arch>/libapp.so out of an AAB. Returns os.ErrNotExist when the
 // archive itself is absent so callers can try the next candidate.

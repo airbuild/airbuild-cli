@@ -618,6 +618,51 @@ func (c *Client) CodePushFlutterPatch(filePath, appID, platform, releaseVersion,
 	return &resp, nil
 }
 
+// FlutterArchDiff is one per-architecture binary diff for a multi-ABI
+// patch upload — Path is the .patch file, ArtifactSha256 the sha256 of the
+// patched artifact devices verify after applying it.
+type FlutterArchDiff struct {
+	Arch           string
+	Path           string
+	ArtifactSha256 string
+}
+
+// CodePushFlutterPatchMulti uploads a multi-architecture Flutter patch: the
+// first diff goes in the bare "file" field (server treats it as primary),
+// the rest as file_<arch> parts paired with artifactSha256_<arch> fields.
+func (c *Client) CodePushFlutterPatchMulti(diffs []FlutterArchDiff, appID, platform, releaseVersion, channel, releaseNotes string) (*CodePushUpdateResponse, error) {
+	if len(diffs) == 0 {
+		return nil, fmt.Errorf("no diffs to upload")
+	}
+	fields := map[string]string{
+		"appId":          appID,
+		"platform":       platform,
+		"releaseVersion": releaseVersion,
+		"channel":        channel,
+		"releaseNotes":   releaseNotes,
+	}
+	files := make([]MultipartFile, 0, len(diffs))
+	for i, d := range diffs {
+		if i == 0 {
+			files = append(files, MultipartFile{FieldName: "file", FilePath: d.Path})
+			fields["architecture"] = d.Arch
+			fields["artifactSha256"] = d.ArtifactSha256
+			continue
+		}
+		files = append(files, MultipartFile{FieldName: "file_" + d.Arch, FilePath: d.Path})
+		fields["artifactSha256_"+d.Arch] = d.ArtifactSha256
+	}
+	data, err := c.codePushMultipartUploadMulti("/api/codepush/flutter/patch", fields, files)
+	if err != nil {
+		return nil, err
+	}
+	var resp CodePushUpdateResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("could not parse response: %w", err)
+	}
+	return &resp, nil
+}
+
 // CodePushFlutterPromoteRequest / RollbackRequest identify a patch either
 // directly by updateId, or by (releaseVersion, platform, patchNumber).
 type CodePushFlutterPatchRef struct {
@@ -704,6 +749,26 @@ func (c *Client) CodePushFlutterReleaseDownload(appID, releaseVersion, platform,
 	}
 	var resp CodePushReleaseDownloadResponse
 	if err := c.get("/api/codepush/flutter/release/download?"+params.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// CodePushSigningKeyResponse is returned by GET
+// /api/codepush/flutter/signing-key — the org's RSA public key material for
+// embedding `patch_public_key` into builds (SHOREBIRD_PUBLIC_KEY env).
+type CodePushSigningKeyResponse struct {
+	KeyID                 string `json:"keyId"`
+	Algorithm             string `json:"algorithm"`
+	RSAPublicKeyPem       string `json:"rsaPublicKeyPem"`
+	RSAPublicKeyDerBase64 string `json:"rsaPublicKeyDerBase64"`
+}
+
+// CodePushFlutterSigningKey fetches the org's RSA patch-signing public key
+// so the CLI can embed it in builds it produces.
+func (c *Client) CodePushFlutterSigningKey(appID string) (*CodePushSigningKeyResponse, error) {
+	var resp CodePushSigningKeyResponse
+	if err := c.get("/api/codepush/flutter/signing-key?appId="+url.QueryEscape(appID), &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -118,6 +121,10 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		}
 
 		artifact := cpReleaseArtifact
+		// Per-arch artifacts to register — multi-ABI Android builds upload
+		// one libapp.so per architecture into the same release row.
+		type archUpload struct{ arch, path string }
+		var uploads []archUpload
 		if artifact == "" {
 			if !cpReleaseSkipBuild {
 				if _, err := shorebird.BundledFlutter(); err != nil {
@@ -130,7 +137,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 						target = "appbundle"
 					}
 					ui.Info("Building %s with Shorebird's bundled Flutter (fully local — no Shorebird account needed)...", target)
-					if err := shorebird.RunFlutter(".", nil, "build", target, "--release"); err != nil {
+					if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), "build", target, "--release"); err != nil {
 						ui.Error("%v", err)
 						return
 					}
@@ -144,14 +151,14 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 					// installable app (re-signing it later is safe too).
 					if cpReleaseNoCodesign {
 						ui.Info("Building iOS app with Shorebird's bundled Flutter (--no-codesign)...")
-						if err := shorebird.RunFlutter(".", nil, "build", "ios", "--release", "--no-codesign"); err != nil {
+						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), "build", "ios", "--release", "--no-codesign"); err != nil {
 							ui.Error("%v", err)
 							return
 						}
 						ui.Muted("Note: sign/install the .app this build produced — patches can't apply to a separately-built binary.")
 					} else {
 						ui.Info("Building signed iOS app with Shorebird's bundled Flutter...")
-						if err := shorebird.RunFlutter(".", nil, "build", "ios", "--release"); err != nil {
+						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), "build", "ios", "--release"); err != nil {
 							ui.Error("%v", err)
 							return
 						}
@@ -159,17 +166,27 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 				}
 			}
 			if platform == "ANDROID" {
-				found, err := shorebird.FindAndroidLibapp(".", cpReleaseArchitecture)
+				libapps, err := shorebird.FindAndroidLibapps(".")
 				if err != nil {
 					ui.Error("%v", err)
 					return
 				}
-				artifact = found
-				ui.Muted("Auto-detected artifact: %s", artifact)
-				// The ABI is the parent dir of libapp.so (e.g. .../arm64-v8a/libapp.so).
-				if cpReleaseArchitecture == "" {
-					cpReleaseArchitecture = filepath.Base(filepath.Dir(artifact))
+				var arches []string
+				for a := range libapps {
+					arches = append(arches, a)
 				}
+				sort.Strings(arches)
+				if cpReleaseArchitecture != "" {
+					if _, ok := libapps[cpReleaseArchitecture]; !ok {
+						ui.Error("architecture %s not in build (found: %s)", cpReleaseArchitecture, strings.Join(arches, ", "))
+						return
+					}
+					arches = []string{cpReleaseArchitecture}
+				}
+				for _, a := range arches {
+					uploads = append(uploads, archUpload{arch: a, path: libapps[a]})
+				}
+				ui.Muted("Auto-detected %d artifact(s): %s", len(uploads), strings.Join(arches, ", "))
 			} else {
 				// iOS release artifact = zip of the App binary plus its
 				// link supplements (App.* files aot-tools needs at patch
@@ -199,9 +216,12 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 			}
 		}
 
-		if _, err := os.Stat(artifact); err != nil {
-			ui.Error("Artifact not found: %s", artifact)
-			return
+		if len(uploads) == 0 {
+			if _, err := os.Stat(artifact); err != nil {
+				ui.Error("Artifact not found: %s", artifact)
+				return
+			}
+			uploads = []archUpload{{arch: cpReleaseArchitecture, path: artifact}}
 		}
 
 		// Record which bundled Flutter built this release — patches must be
@@ -215,14 +235,25 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		cfg := mustLoadConfig()
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
-		ui.Info("Uploading release artifact...")
-		resp, err := client.CodePushFlutterRelease(
-			artifact, cpReleaseAppID, platform, cpReleaseVersion, cpReleaseArchitecture,
-			cpReleaseFlutterRevision, cpReleaseShorebirdAppID, cpReleaseChannel, cpReleaseNotes,
-		)
-		if err != nil {
-			ui.Error("Failed to register release: %v", err)
-			return
+		ui.Info("Uploading release artifact(s)...")
+		var resp *api.CodePushReleaseResponse
+		for _, u := range uploads {
+			resp, err = client.CodePushFlutterRelease(
+				u.path, cpReleaseAppID, platform, cpReleaseVersion, u.arch,
+				cpReleaseFlutterRevision, cpReleaseShorebirdAppID, cpReleaseChannel, cpReleaseNotes,
+			)
+			if err != nil {
+				ui.Error("Failed to register release: %v", err)
+				return
+			}
+		}
+
+		// Record the packaged build's contents so `patch` can warn about
+		// non-Dart changes (native code, assets, engine) it can't ship.
+		// Only when this command produced the build — a --skip-build or
+		// --artifact upload may not match the local build dir.
+		if !cpReleaseSkipBuild && cpReleaseArtifact == "" {
+			writeBuildManifest(".", platform, cpReleaseVersion)
 		}
 
 		ui.Success("Release registered")
@@ -286,10 +317,9 @@ var codepushFlutterPatchCmd = &cobra.Command{
 			return
 		}
 
-		artifact := cpPatchArtifact
-		artifactHash := cpPatchArtifactHash
+		var diffs []api.FlutterArchDiff
 
-		if artifact == "" {
+		if cpPatchArtifact == "" {
 			// --- Auto-diff flow ---
 			// When --artifact is omitted, the CLI builds the patch and
 			// locates the resulting diff automatically.
@@ -298,11 +328,11 @@ var codepushFlutterPatchCmd = &cobra.Command{
 			//   1. Build libapp.so with Shorebird's bundled Flutter (a patch
 			//      is just the same release build with new Dart code — the
 			//      updater ships the binary diff, not a build recipe).
-			//   2. Locate the freshly built libapp.so via FindAndroidLibapp
-			//   3. Download the release's original libapp.so from AirBuild
+			//   2. Locate the freshly built libapp.so per architecture
+			//   3. Download the release's per-arch libapp.so from AirBuild
 			//   4. Use Shorebird's `patch` binary (public artifact download)
-			//      to create the bidiff+zstd diff
-			//   5. Upload the diff to AirBuild
+			//      to create the bidiff+zstd diff for each arch
+			//   5. Upload the diffs to AirBuild in one patch
 
 			if _, err := shorebird.BundledFlutter(); err != nil {
 				ui.Error("%v", err)
@@ -310,26 +340,41 @@ var codepushFlutterPatchCmd = &cobra.Command{
 			}
 
 			if platform == "ANDROID" {
-				artifact, artifactHash, err = runAndroidAutoDiff(cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchArchitecture, cpPatchChannel, cpPatchAppID)
+				diffs, err = runAndroidAutoDiff(cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchArchitecture, cpPatchChannel, cpPatchAppID)
 			} else {
-				artifact, artifactHash, err = runIOSAutoDiff(cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchChannel, cpPatchAppID)
+				var diffPath, hash string
+				diffPath, hash, err = runIOSAutoDiff(cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchChannel, cpPatchAppID)
+				if cpPatchArchitecture == "" {
+					cpPatchArchitecture = "aarch64"
+				}
+				if err == nil {
+					diffs = []api.FlutterArchDiff{{Arch: cpPatchArchitecture, Path: diffPath, ArtifactSha256: hash}}
+				}
 			}
 			if err != nil {
 				ui.Error("%v", err)
 				return
 			}
+		} else {
+			artifact := cpPatchArtifact
+			if _, err := os.Stat(artifact); err != nil {
+				ui.Error("Artifact not found: %s", artifact)
+				return
+			}
+			if platform == "IOS" && cpPatchArchitecture == "" {
+				cpPatchArchitecture = "aarch64"
+			}
+			diffs = []api.FlutterArchDiff{{Arch: cpPatchArchitecture, Path: artifact, ArtifactSha256: cpPatchArtifactHash}}
 		}
 
-		if _, err := os.Stat(artifact); err != nil {
-			ui.Error("Artifact not found: %s", artifact)
-			return
+		for _, d := range diffs {
+			if _, err := os.Stat(d.Path); err != nil {
+				ui.Error("Artifact not found: %s", d.Path)
+				return
+			}
 		}
 
-		if platform == "IOS" && cpPatchArchitecture == "" {
-			cpPatchArchitecture = "aarch64"
-		}
-
-		if artifactHash == "" {
+		if diffs[0].ArtifactSha256 == "" {
 			// Without the patched-artifact hash the server can't send a
 			// `hash` the updater accepts — devices will download the patch
 			// then reject it ("Update rejected: hash mismatch").
@@ -340,8 +385,8 @@ var codepushFlutterPatchCmd = &cobra.Command{
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		ui.Info("Uploading patch...")
-		resp, err := client.CodePushFlutterPatch(
-			artifact, cpPatchAppID, platform, cpPatchReleaseVersion, cpPatchArchitecture, cpPatchChannel, cpPatchNotes, artifactHash,
+		resp, err := client.CodePushFlutterPatchMulti(
+			diffs, cpPatchAppID, platform, cpPatchReleaseVersion, cpPatchChannel, cpPatchNotes,
 		)
 		if err != nil {
 			ui.Error("Failed to create patch: %v", err)
@@ -351,7 +396,9 @@ var codepushFlutterPatchCmd = &cobra.Command{
 		ui.Success("Patch #%d created (DRAFT, 0%% rollout)", resp.Update.PatchNumber)
 		// Auto-generated diffs are temp files — clean up after upload.
 		if cpPatchArtifact == "" {
-			os.Remove(artifact) //nolint:errcheck
+			for _, d := range diffs {
+				os.Remove(d.Path) //nolint:errcheck
+			}
 		}
 		ui.Info("Promote it with: airbuild codepush flutter promote --patch %d --channel %s --rollout 25",
 			resp.Update.PatchNumber, valueOr(cpPatchChannel, "production"))
@@ -885,87 +932,159 @@ func validateRolloutPercent(pct int) error {
 	return nil
 }
 
+// patchSigningEnv returns the SHOREBIRD_PUBLIC_KEY env map for flutter
+// builds. Shorebird's forked flutter_tools reads that env var and writes
+// `patch_public_key` into the compiled shorebird.yaml asset (the yaml's own
+// `patch_public_key` key is NOT copied — env only), which makes the
+// on-device updater enforce `hash_signature` on every patch. Best-effort:
+// returns nil when the key can't be fetched, keeping today's unsigned
+// behavior.
+func patchSigningEnv(appID string) map[string]string {
+	cfg := mustLoadConfig()
+	client := api.New(cfg.APIURL, cfg.APIKey)
+	key, err := client.CodePushFlutterSigningKey(appID)
+	if err != nil || key.RSAPublicKeyDerBase64 == "" {
+		ui.Muted("Patch signing key unavailable — building without patch_public_key")
+		return nil
+	}
+	ui.Info("Embedding patch signing key (patch_public_key) into build")
+	return map[string]string{"SHOREBIRD_PUBLIC_KEY": key.RSAPublicKeyDerBase64}
+}
+
 // runAndroidAutoDiff implements the full Android auto-diff flow: rebuild
 // libapp.so with Shorebird's bundled Flutter, download the release's
-// libapp.so from AirBuild, and create the diff using Shorebird's `patch`
-// binary. Returns the path to the generated diff file and the sha256 of
-// the patched libapp.so — the artifact hash the on-device updater
-// verifies after applying the diff.
-func runAndroidAutoDiff(releaseVersion string, skipBuild bool, architecture, channel, appID string) (string, string, error) {
+// per-architecture libapp.so from AirBuild, and create one binary diff per
+// architecture using Shorebird's `patch` binary. Returns the diffs with
+// their patched-artifact sha256s — the hashes on-device updaters verify
+// after applying the diff.
+func runAndroidAutoDiff(releaseVersion string, skipBuild bool, architecture, channel, appID string) ([]api.FlutterArchDiff, error) {
 	// Step 1: Build the patch's libapp.so — the same release build with the
 	// new Dart code, using the bundled (updater-capable) Flutter SDK.
 	if !skipBuild {
 		ui.Info("Building patch artifact with Shorebird's bundled Flutter...")
-		if err := shorebird.RunFlutter(".", nil, "build", "apk", "--release"); err != nil {
-			return "", "", fmt.Errorf("patch build failed: %w", err)
+		if err := shorebird.RunFlutter(".", patchSigningEnv(appID), "build", "apk", "--release"); err != nil {
+			return nil, fmt.Errorf("patch build failed: %w", err)
 		}
 	}
 
-	// Step 2: Locate the freshly built patch libapp.so.
-	patchLibapp, err := shorebird.FindAndroidLibapp(".", architecture)
+	// Warn if the patch build contains non-Dart changes the OTA can't ship
+	// (native code, assets, or a different engine revision).
+	warnNonDartChanges(".", "ANDROID", releaseVersion)
+
+	// Step 2: Locate the freshly built patch libapp.so for every packaged
+	// architecture.
+	libapps, err := shorebird.FindAndroidLibapps(".")
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
-	ui.Muted("Found patch libapp.so: %s", patchLibapp)
+	if architecture != "" {
+		found, ok := libapps[architecture]
+		if !ok {
+			var have []string
+			for a := range libapps {
+				have = append(have, a)
+			}
+			return nil, fmt.Errorf("architecture %s not in build (found: %s)", architecture, strings.Join(have, ", "))
+		}
+		libapps = map[string]string{architecture: found}
+	}
+	var localArches []string
+	for a := range libapps {
+		localArches = append(localArches, a)
+	}
+	sort.Strings(localArches)
+	ui.Muted("Found patch libapp.so for: %s", strings.Join(localArches, ", "))
 
 	// Step 3: Locate Shorebird's `patch` binary (downloads it from
 	// Shorebird's public artifact bucket on first use — no auth needed).
 	patchBinary, err := shorebird.EnsurePatchBinary()
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	ui.Muted("Using Shorebird patch binary: %s", patchBinary)
 
-	// Step 4: Download the release's original libapp.so from AirBuild.
+	// Step 4: Fetch the release's architecture list, then download each
+	// arch's artifact and diff locally-built vs release libapp.so.
 	cfg := mustLoadConfig()
 	client := api.New(cfg.APIURL, cfg.APIKey)
 
-	ui.Info("Downloading release %s libapp.so from AirBuild...", releaseVersion)
 	dlResp, err := client.CodePushFlutterReleaseDownload(
 		appID, releaseVersion, "ANDROID", architecture, channel,
 	)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get release download URL: %w", err)
+		return nil, fmt.Errorf("failed to get release download URL: %w", err)
+	}
+	releaseArches := map[string]bool{}
+	for _, a := range dlResp.Release.Architectures {
+		releaseArches[a] = true
+	}
+
+	// Diff the arches the release actually has artifacts for — diffing
+	// against an artifact of another arch produces a patch that can never
+	// apply (its base doesn't match the device's libapp.so).
+	var targets []string
+	for _, a := range localArches {
+		if len(releaseArches) == 0 || releaseArches[a] {
+			targets = append(targets, a)
+		} else {
+			ui.Muted("Skipping %s — release %s has no artifact for it", a, releaseVersion)
+		}
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no architectures in common between this build (%s) and release %s (%v)",
+			strings.Join(localArches, ", "), releaseVersion, dlResp.Release.Architectures)
+	}
+	for a := range releaseArches {
+		if _, ok := libapps[a]; !ok {
+			ui.Muted("Note: release covers %s but this build doesn't include it — devices on %s won't get this patch", a, a)
+		}
 	}
 
 	tmpDir, err := os.MkdirTemp("", "airbuild-patch-*")
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create temp directory: %w", err)
+		return nil, fmt.Errorf("failed to create temp directory: %w", err)
 	}
 	defer os.RemoveAll(tmpDir) //nolint:errcheck
 
-	releaseLibappPath := filepath.Join(tmpDir, "release-libapp.so")
-	if err := client.DownloadFile(dlResp.DownloadUrl, releaseLibappPath); err != nil {
-		return "", "", fmt.Errorf("failed to download release libapp.so: %w", err)
-	}
-	ui.Muted("Downloaded release libapp.so (%s) to %s", dlResp.Release.Version, releaseLibappPath)
+	var diffs []api.FlutterArchDiff
+	for _, arch := range targets {
+		ui.Info("Diffing %s...", arch)
+		resp, err := client.CodePushFlutterReleaseDownload(
+			appID, releaseVersion, "ANDROID", arch, channel,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get release download URL for %s: %w", arch, err)
+		}
+		releaseLibappPath := filepath.Join(tmpDir, "release-libapp-"+arch+".so")
+		if err := client.DownloadFile(resp.DownloadUrl, releaseLibappPath); err != nil {
+			return nil, fmt.Errorf("failed to download release libapp.so for %s: %w", arch, err)
+		}
 
-	// Step 5: Create the binary diff using Shorebird's patch binary. The
-	// diff goes in its own temp file (not tmpDir — that's deleted on
-	// return, and the caller needs the path to survive for the upload).
-	diffFile, err := os.CreateTemp("", "airbuild-patch-*.diff")
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create diff file: %w", err)
-	}
-	diffPath := diffFile.Name()
-	diffFile.Close() //nolint:errcheck
-	ui.Info("Creating binary diff...")
-	if err := shorebird.CreateDiff(patchBinary, releaseLibappPath, patchLibapp, diffPath); err != nil {
-		return "", "", fmt.Errorf("failed to create diff: %w", err)
-	}
-	if err := shorebird.ValidateDiffFile(diffPath); err != nil {
-		return "", "", fmt.Errorf("generated diff failed validation: %w", err)
-	}
+		// The diff goes in its own temp file (not tmpDir — that's deleted
+		// on return, and the caller needs the path to survive the upload).
+		diffFile, err := os.CreateTemp("", "airbuild-patch-*.diff")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create diff file: %w", err)
+		}
+		diffPath := diffFile.Name()
+		diffFile.Close() //nolint:errcheck
+		if err := shorebird.CreateDiff(patchBinary, releaseLibappPath, libapps[arch], diffPath); err != nil {
+			return nil, fmt.Errorf("failed to create diff for %s: %w", arch, err)
+		}
+		if err := shorebird.ValidateDiffFile(diffPath); err != nil {
+			return nil, fmt.Errorf("generated %s diff failed validation: %w", arch, err)
+		}
 
-	// The updater verifies the *patched artifact* hash (the new libapp.so)
-	// after applying the diff — send it alongside the upload.
-	artifactHash, err := sha256File(patchLibapp)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to hash patch artifact: %w", err)
+		// The updater verifies the *patched artifact* hash (the new
+		// libapp.so) after applying the diff — send it alongside.
+		artifactHash, err := sha256File(libapps[arch])
+		if err != nil {
+			return nil, fmt.Errorf("failed to hash %s patch artifact: %w", arch, err)
+		}
+		ui.Muted("Created %s diff: %s", arch, diffPath)
+		diffs = append(diffs, api.FlutterArchDiff{Arch: arch, Path: diffPath, ArtifactSha256: artifactHash})
 	}
-
-	ui.Muted("Created diff: %s", diffPath)
-	return diffPath, artifactHash, nil
+	return diffs, nil
 }
 
 // packageIosReleaseArtifact produces the zip release artifact AirBuild
@@ -1042,9 +1161,10 @@ func runIOSAutoDiff(releaseVersion string, skipBuild bool, channel, appID string
 	buildStart := time.Now()
 	if !skipBuild {
 		ui.Info("Building iOS patch with Shorebird's bundled Flutter (--no-codesign)...")
-		if err := shorebird.RunFlutter(".", nil, "build", "ios", "--release", "--no-codesign"); err != nil {
+		if err := shorebird.RunFlutter(".", patchSigningEnv(appID), "build", "ios", "--release", "--no-codesign"); err != nil {
 			return "", "", fmt.Errorf("patch build failed: %w", err)
 		}
+		warnNonDartChanges(".", "IOS", releaseVersion)
 	} else {
 		buildStart = time.Time{} // accept any existing app.dill
 	}
@@ -1202,4 +1322,246 @@ func valueOr(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+// --- Build manifests: native/asset change detection ---
+//
+// A Dart patch can only replace the compiled Dart snapshot (libapp.so /
+// App binary). Native code, assets, manifests, and engine changes are NOT
+// patchable — shipping a patch whose other files changed produces a silent
+// no-op or a subtle mismatch. At release time we record a manifest of the
+// packaged build's contents; at patch time we compare and warn.
+
+type buildManifest map[string]string // archive-relative path → sha256
+
+func manifestPath(projectDir, platform, version string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, version)
+	return filepath.Join(projectDir, ".airbuild", "manifests", strings.ToLower(platform)+"-"+safe+".json")
+}
+
+// classifyManifestEntry buckets a packaged file by what an OTA patch can
+// and cannot change. "" means "ignore" (packaging/signing churn that
+// legitimately differs between builds).
+func classifyManifestEntry(platform, name string) string {
+	switch platform {
+	case "ANDROID":
+		switch {
+		case strings.HasPrefix(name, "META-INF/"):
+			return "" // signing output
+		case strings.HasSuffix(name, "/libapp.so"), name == "libapp.so":
+			return "dart"
+		case strings.HasSuffix(name, "/libflutter.so"), strings.HasSuffix(name, "/libflutter_package.so"):
+			return "engine"
+		case strings.HasPrefix(name, "assets/flutter_assets/"):
+			return "asset"
+		case strings.HasSuffix(name, ".dex"),
+			name == "AndroidManifest.xml", name == "resources.arsc",
+			strings.HasPrefix(name, "res/"), strings.HasPrefix(name, "kotlin/"),
+			strings.HasPrefix(name, "lib/"):
+			return "native"
+		default:
+			return "asset"
+		}
+	case "IOS":
+		switch {
+		case strings.HasPrefix(name, "_CodeSignature/"),
+			name == "embedded.mobileprovision", name == "PkgInfo",
+			name == ".DS_Store", strings.HasSuffix(name, "/.DS_Store"):
+			return ""
+		case strings.HasSuffix(name, "App.framework/App"):
+			return "dart"
+		case strings.Contains(name, "App.framework/flutter_assets/"):
+			return "asset"
+		case strings.Contains(name, "Flutter.framework/"):
+			return "engine"
+		default:
+			return "native"
+		}
+	}
+	return "native"
+}
+
+// zipManifest hashes every entry of a zip archive (APK/AAB).
+func zipManifest(path string) (buildManifest, error) {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close() //nolint:errcheck
+	m := buildManifest{}
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, err
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, rc); err != nil {
+			rc.Close() //nolint:errcheck
+			return nil, err
+		}
+		rc.Close() //nolint:errcheck
+		m[f.Name] = hex.EncodeToString(h.Sum(nil))
+	}
+	return m, nil
+}
+
+// dirManifest hashes every file under root, keyed by path relative to root.
+func dirManifest(root string) (buildManifest, error) {
+	m := buildManifest{}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr
+		}
+		h, err := sha256File(path)
+		if err != nil {
+			return nil // skip unreadable files
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		m[filepath.ToSlash(rel)] = h
+		return nil
+	})
+	return m, err
+}
+
+// writeBuildManifest persists the release build's manifest for the patch
+// command to compare against. Best-effort — silently skipped when the
+// packaged artifact can't be found (e.g. --artifact/--skip-build flows).
+func writeBuildManifest(projectDir, platform, version string) {
+	var m buildManifest
+	var err error
+	if platform == "ANDROID" {
+		for _, candidate := range []string{
+			filepath.Join(projectDir, "build", "app", "outputs", "flutter-apk", "app-release.apk"),
+			filepath.Join(projectDir, "build", "app", "outputs", "bundle", "release", "app-release.aab"),
+		} {
+			if m, err = zipManifest(candidate); err == nil {
+				break
+			}
+		}
+	} else {
+		// iOS: hash the built .app directory.
+		for _, candidate := range []string{
+			filepath.Join(projectDir, "build", "ios", "iphoneos", "Runner.app"),
+			filepath.Join(projectDir, "build", "ios", "ipa", "*.app"),
+		} {
+			matches, _ := filepath.Glob(candidate)
+			for _, dir := range matches {
+				if m, err = dirManifest(dir); err == nil && len(m) > 0 {
+					break
+				}
+			}
+			if len(m) > 0 {
+				break
+			}
+		}
+	}
+	if len(m) == 0 {
+		return
+	}
+	path := manifestPath(projectDir, platform, version)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+// loadBuildManifest reads the manifest recorded at release time. Returns
+// nil when absent (foreign machine, --skip-build release, etc).
+func loadBuildManifest(projectDir, platform, version string) buildManifest {
+	data, err := os.ReadFile(manifestPath(projectDir, platform, version))
+	if err != nil {
+		return nil
+	}
+	var m buildManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+// warnNonDartChanges compares the release build's manifest against the
+// patch build's and warns about changes an OTA patch cannot deliver:
+// native code, bundled assets, and (critically) engine changes.
+func warnNonDartChanges(projectDir, platform, releaseVersion string) {
+	old := loadBuildManifest(projectDir, platform, releaseVersion)
+	if len(old) == 0 {
+		return // nothing to compare — stay quiet
+	}
+	var fresh buildManifest
+	var err error
+	if platform == "ANDROID" {
+		fresh, err = zipManifest(filepath.Join(projectDir, "build", "app", "outputs", "flutter-apk", "app-release.apk"))
+		if err != nil {
+			fresh, err = zipManifest(filepath.Join(projectDir, "build", "app", "outputs", "bundle", "release", "app-release.aab"))
+		}
+	} else {
+		fresh, err = dirManifest(filepath.Join(projectDir, "build", "ios", "iphoneos", "Runner.app"))
+	}
+	if err != nil || len(fresh) == 0 {
+		return
+	}
+
+	var engineChanged, nativeChanged, assetChanged []string
+	names := map[string]bool{}
+	for n := range old {
+		names[n] = true
+	}
+	for n := range fresh {
+		names[n] = true
+	}
+	for name := range names {
+		if old[name] == fresh[name] {
+			continue
+		}
+		switch classifyManifestEntry(platform, name) {
+		case "":
+			continue // packaging churn — not a real change
+		case "dart":
+			continue // the point of the patch
+		case "engine":
+			engineChanged = append(engineChanged, name)
+		case "native":
+			nativeChanged = append(nativeChanged, name)
+		case "asset":
+			assetChanged = append(assetChanged, name)
+		}
+	}
+
+	show := func(label string, files []string) {
+		sort.Strings(files)
+		ui.Error("%s", label)
+		const max = 8
+		for i, f := range files {
+			if i >= max {
+				ui.Muted("    ... and %d more", len(files)-max)
+				break
+			}
+			ui.Muted("    %s", f)
+		}
+	}
+	if len(engineChanged) > 0 {
+		show("⚠ Flutter engine changed since this release — patches built on a different engine revision will NOT apply. Re-register the release with this engine, or rebuild with the release's flutter-revision.", engineChanged)
+	}
+	if len(nativeChanged) > 0 {
+		show("⚠ Native files changed since the release — OTA patches only ship Dart code; these changes will NOT reach devices:", nativeChanged)
+	}
+	if len(assetChanged) > 0 {
+		show("⚠ Asset files changed since the release — assets are not patchable; they will NOT reach devices:", assetChanged)
+	}
 }
