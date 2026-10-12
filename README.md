@@ -223,13 +223,15 @@ flags, channels, staged rollout, and instant rollback.
 
 ### Flutter CodePush
 
-Requires the [Shorebird CLI](https://pub.dev/packages/shorebird_cli):
+No Shorebird account or CLI is needed — the AirBuild CLI bundles Shorebird's Flutter toolchain:
 
 ```bash
-dart pub global activate shorebird_cli
+airbuild codepush flutter install   # fetch the bundled toolchain (~/.shorebird)
+airbuild codepush flutter init      # write shorebird.yaml (app_id, base_url, auto_update)
+airbuild codepush flutter doctor    # verify the environment
 ```
 
-Your app must be built with the Shorebird updater embedded. See the [Shorebird docs](https://shorebird.dev/) for setup.
+`release` and `patch` build your app locally with that toolchain, which embeds Shorebird's open-source updater runtime pointed at your AirBuild `base_url`. Only Dart code ships in patches — native code, assets, and engine changes need a new binary release.
 
 #### `airbuild codepush flutter release`
 
@@ -243,37 +245,40 @@ airbuild codepush flutter release android --version 1.0.0+1
 | ---- | -------- | ------- | ----------- |
 | `--app` | no | `.airbuild.json` | App ID (read from config if omitted) |
 | `--version` | yes | — | App version, e.g. `1.0.0+1` |
-| `--architecture` | no | auto | Target architecture, e.g. `arm64-v8a` |
+| `--format` | no | `apk` | `apk` or `aab` (Android) |
+| `--architecture` | no | auto | Restrict to one architecture, e.g. `arm64-v8a` (Android releases auto-detect all ABIs in the build) |
 | `--channel` | no | `production` | Distribution channel |
 | `--flutter-revision` | no | — | Flutter SDK version used |
 | `--shorebird-app-id` | no | — | Shorebird app_id |
 | `--release-notes` | no | — | Release notes |
 | `--artifact` | no | auto-detect | Path to a pre-built release artifact (skips the build step) |
-| `--skip-build` | no | `false` | Don't build — just upload `--artifact` |
+| `--skip-build` | no | `false` | Don't build — just upload the existing build output / `--artifact` |
+| `--no-codesign` | no | `false` | Skip code signing (iOS; for CI pipelines that re-sign) |
+| `--dart-define` | no | — | Compile-time constant `KEY=VALUE` (repeatable, forwarded to `flutter build`) |
+| `--dart-define-from-file` | no | — | JSON file of dart-defines (repeatable) |
+
+> **iOS note:** the uploaded artifact is zipped from the signed `.app` the CLI builds — install *that* binary (re-signing is fine; recompiling invalidates the diff base).
 
 #### `airbuild codepush flutter patch`
 
-Create a Flutter patch. The CLI builds your patched app, computes a diff against the release, and uploads it — no manual diffing required.
+Create a Flutter patch. The CLI builds your patched app, diffs every architecture against the release, and uploads — no manual diffing required. It warns if non-Dart files changed (native code/assets/engine can't ship OTA) or if `--dart-define` values drift from the release build.
 
 ```bash
 airbuild codepush flutter patch android --release-version 1.0.0+1
-```
-
-If the CLI can't locate the generated diff (e.g. on iOS in some environments), pass `--artifact` with a pre-built diff:
-
-```bash
-airbuild codepush flutter patch ios --release-version 1.0.0+1 --artifact path/to/patch.diff
 ```
 
 | Flag | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
 | `--app` | no | `.airbuild.json` | App ID (read from config if omitted) |
 | `--release-version` | yes | — | Release version this patch targets |
-| `--architecture` | no | — | Target architecture |
+| `--architecture` | no | — | Diff only one architecture |
 | `--channel` | no | `production` | Distribution channel |
 | `--release-notes` | no | — | Patch notes |
-| `--artifact` | no | auto | Path to a pre-built diff (skips the build step) |
-| `--skip-build` | no | `false` | Don't build — use existing build output or `--artifact` |
+| `--artifact` | no | auto | Path to a pre-built diff (skips the build + diff steps) |
+| `--artifact-sha256` | no | — | SHA-256 of the *patched* artifact (required with `--artifact` for hash verification) |
+| `--skip-build` | no | `false` | Don't build — diff the existing build output |
+| `--dart-define` | no | — | Compile-time constant `KEY=VALUE` (repeatable) |
+| `--dart-define-from-file` | no | — | JSON file of dart-defines (repeatable) |
 
 
 #### `airbuild codepush flutter promote`
