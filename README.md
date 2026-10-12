@@ -223,7 +223,7 @@ flags, channels, staged rollout, and instant rollback.
 
 ### Flutter CodePush
 
-No Shorebird account or CLI is needed — the AirBuild CLI bundles Shorebird's Flutter toolchain:
+The AirBuild CLI bundles its own Flutter CodePush toolchain — install it once:
 
 ```bash
 airbuild codepush flutter install   # fetch the bundled toolchain (~/.shorebird)
@@ -231,7 +231,7 @@ airbuild codepush flutter init      # write shorebird.yaml (app_id, base_url, au
 airbuild codepush flutter doctor    # verify the environment
 ```
 
-`release` and `patch` build your app locally with that toolchain, which embeds Shorebird's open-source updater runtime pointed at your AirBuild `base_url`. Only Dart code ships in patches — native code, assets, and engine changes need a new binary release.
+`release` and `patch` build your app locally with that toolchain, which embeds the on-device updater pointed at your AirBuild `base_url`. Only Dart code ships in patches — native code, assets, and engine changes need a new binary release.
 
 #### `airbuild codepush flutter release`
 
@@ -249,7 +249,7 @@ airbuild codepush flutter release android --version 1.0.0+1
 | `--architecture` | no | auto | Restrict to one architecture, e.g. `arm64-v8a` (Android releases auto-detect all ABIs in the build) |
 | `--channel` | no | `production` | Distribution channel |
 | `--flutter-revision` | no | — | Flutter SDK version used |
-| `--shorebird-app-id` | no | — | Shorebird app_id |
+| `--shorebird-app-id` | no | — | Upstream runtime app_id |
 | `--release-notes` | no | — | Release notes |
 | `--artifact` | no | auto-detect | Path to a pre-built release artifact (skips the build step) |
 | `--skip-build` | no | `false` | Don't build — just upload the existing build output / `--artifact` |
