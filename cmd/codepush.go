@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/airbuild/airbuild-cli/internal/api"
 	"github.com/airbuild/airbuild-cli/internal/expo"
@@ -84,6 +85,7 @@ var (
 	cpReleaseNotes           string
 	cpReleaseArtifact        string
 	cpReleaseSkipBuild       bool
+	cpReleaseNoCodesign      bool
 	cpReleaseFormat          string
 )
 
@@ -118,22 +120,42 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		artifact := cpReleaseArtifact
 		if artifact == "" {
 			if !cpReleaseSkipBuild {
-				if platform != "ANDROID" {
-					ui.Error("Local iOS release builds aren't supported yet — pass --artifact <path to built artifact>.")
-					return
-				}
 				if _, err := shorebird.BundledFlutter(); err != nil {
 					ui.Error("%v", err)
 					return
 				}
-				target := "apk"
-				if cpReleaseFormat == "aab" || cpReleaseFormat == "appbundle" {
-					target = "appbundle"
-				}
-				ui.Info("Building %s with Shorebird's bundled Flutter (fully local — no Shorebird account needed)...", target)
-				if err := shorebird.RunFlutter(".", nil, "build", target, "--release"); err != nil {
-					ui.Error("%v", err)
-					return
+				if platform == "ANDROID" {
+					target := "apk"
+					if cpReleaseFormat == "aab" || cpReleaseFormat == "appbundle" {
+						target = "appbundle"
+					}
+					ui.Info("Building %s with Shorebird's bundled Flutter (fully local — no Shorebird account needed)...", target)
+					if err := shorebird.RunFlutter(".", nil, "build", target, "--release"); err != nil {
+						ui.Error("%v", err)
+						return
+					}
+				} else {
+					// iOS: the release artifact MUST come from the exact
+					// build that ships to devices — independent compilations
+					// produce different AOT snapshots, so the on-device diff
+					// base would never match a separately-built binary.
+					// Codesigning does NOT affect the extracted snapshot,
+					// so the signed build produced here doubles as the
+					// installable app (re-signing it later is safe too).
+					if cpReleaseNoCodesign {
+						ui.Info("Building iOS app with Shorebird's bundled Flutter (--no-codesign)...")
+						if err := shorebird.RunFlutter(".", nil, "build", "ios", "--release", "--no-codesign"); err != nil {
+							ui.Error("%v", err)
+							return
+						}
+						ui.Muted("Note: sign/install the .app this build produced — patches can't apply to a separately-built binary.")
+					} else {
+						ui.Info("Building signed iOS app with Shorebird's bundled Flutter...")
+						if err := shorebird.RunFlutter(".", nil, "build", "ios", "--release"); err != nil {
+							ui.Error("%v", err)
+							return
+						}
+					}
 				}
 			}
 			if platform == "ANDROID" {
@@ -149,8 +171,31 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 					cpReleaseArchitecture = filepath.Base(filepath.Dir(artifact))
 				}
 			} else {
-				ui.Error("Auto-detection of the iOS release artifact isn't supported yet — pass --artifact <path to App binary/framework>.")
+				// iOS release artifact = zip of the App binary plus its
+				// link supplements (App.* files aot-tools needs at patch
+				// time), the same layout Shorebird stores per-release.
+				packed, err := packageIosReleaseArtifact("", ".")
+				if err != nil {
+					ui.Error("%v", err)
+					return
+				}
+				artifact = packed
+				ui.Muted("Packaged iOS release artifact: %s", artifact)
+				if cpReleaseArchitecture == "" {
+					cpReleaseArchitecture = "aarch64"
+				}
+			}
+		} else if platform == "IOS" && !strings.HasSuffix(artifact, ".zip") {
+			// User-supplied iOS artifact: accept .app/.xcarchive dirs and raw
+			// App binaries — repackage into the zip layout patch expects.
+			packed, err := packageIosReleaseArtifact(artifact, ".")
+			if err != nil {
+				ui.Error("%v", err)
 				return
+			}
+			artifact = packed
+			if cpReleaseArchitecture == "" {
+				cpReleaseArchitecture = "aarch64"
 			}
 		}
 
@@ -201,6 +246,7 @@ func init() {
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseNotes, "release-notes", "", "Release notes")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseArtifact, "artifact", "", "Path to the built libapp.so / release artifact (skips auto-detection)")
 	codepushFlutterReleaseCmd.Flags().BoolVar(&cpReleaseSkipBuild, "skip-build", false, "Don't build — just upload --artifact or auto-detected output")
+	codepushFlutterReleaseCmd.Flags().BoolVar(&cpReleaseNoCodesign, "no-codesign", false, "iOS: build unsigned (for CI where the same .app is signed later — never recompile)")
 	codepushFlutterReleaseCmd.Flags().StringVar(&cpReleaseFormat, "format", "apk", "Android build format: apk (install links) or aab (Play Store)")
 	codepushFlutterCmd.AddCommand(codepushFlutterReleaseCmd)
 }
@@ -265,16 +311,11 @@ var codepushFlutterPatchCmd = &cobra.Command{
 
 			if platform == "ANDROID" {
 				artifact, artifactHash, err = runAndroidAutoDiff(cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchArchitecture, cpPatchChannel, cpPatchAppID)
-				if err != nil {
-					ui.Error("%v", err)
-					return
-				}
 			} else {
-				ui.Error(`iOS auto-diff isn't supported yet — iOS patches need aot_tools + analyze_snapshot.
-You can still create a patch manually:
-  1. Build the iOS patch artifact yourself
-  2. Produce the diff.patch file
-  3. Pass it via --artifact`)
+				artifact, artifactHash, err = runIOSAutoDiff(cpPatchReleaseVersion, cpPatchSkipBuild, cpPatchChannel, cpPatchAppID)
+			}
+			if err != nil {
+				ui.Error("%v", err)
 				return
 			}
 		}
@@ -282,6 +323,10 @@ You can still create a patch manually:
 		if _, err := os.Stat(artifact); err != nil {
 			ui.Error("Artifact not found: %s", artifact)
 			return
+		}
+
+		if platform == "IOS" && cpPatchArchitecture == "" {
+			cpPatchArchitecture = "aarch64"
 		}
 
 		if artifactHash == "" {
@@ -919,6 +964,221 @@ func runAndroidAutoDiff(releaseVersion string, skipBuild bool, architecture, cha
 		return "", "", fmt.Errorf("failed to hash patch artifact: %w", err)
 	}
 
+	ui.Muted("Created diff: %s", diffPath)
+	return diffPath, artifactHash, nil
+}
+
+// packageIosReleaseArtifact produces the zip release artifact AirBuild
+// stores for iOS: the App Mach-O binary plus its link supplements. When
+// src is empty, the binary is auto-detected from the latest build output
+// under projectDir; otherwise src may be an .app/.xcarchive directory or
+// a raw App binary. Returns the path to a temp zip.
+func packageIosReleaseArtifact(src, projectDir string) (string, error) {
+	var appPath string
+	var supplements []string
+	if src == "" {
+		found, err := shorebird.FindIosAppBinary(projectDir)
+		if err != nil {
+			return "", err
+		}
+		appPath = found
+		supplements = shorebird.CollectIosSupplements(shorebird.IosSupplementDir(projectDir))
+	} else {
+		info, err := os.Stat(src)
+		if err != nil {
+			return "", fmt.Errorf("artifact not found: %s", src)
+		}
+		switch {
+		case info.IsDir() && (strings.HasSuffix(src, ".app") || strings.HasSuffix(src, ".xcarchive")):
+			matches, err := filepath.Glob(filepath.Join(src, "**", "Frameworks", "App.framework", "App"))
+			if err != nil || len(matches) == 0 {
+				return "", fmt.Errorf("no Frameworks/App.framework/App found inside %s", src)
+			}
+			appPath = matches[0]
+			// Supplements may sit beside the App binary or under
+			// build/ios/shorebird — collect what exists.
+			supplements = append(supplements, shorebird.CollectIosSupplements(filepath.Dir(appPath))...)
+			supplements = append(supplements, shorebird.CollectIosSupplements(shorebird.IosSupplementDir(projectDir))...)
+		case info.IsDir():
+			return "", fmt.Errorf("unsupported artifact directory %s — pass a .app, .xcarchive, zip, or App binary", src)
+		default:
+			appPath = src
+			supplements = shorebird.CollectIosSupplements(filepath.Dir(src))
+		}
+	}
+
+	out, err := os.CreateTemp("", "airbuild-ios-release-*.zip")
+	if err != nil {
+		return "", err
+	}
+	out.Close() //nolint:errcheck
+	if err := shorebird.CreateIosReleaseArtifact(appPath, supplements, out.Name()); err != nil {
+		os.Remove(out.Name()) //nolint:errcheck
+		return "", err
+	}
+	if len(supplements) == 0 {
+		ui.Muted("No link supplements found — iOS patches built against this release may link less efficiently")
+	}
+	return out.Name(), nil
+}
+
+// runIOSAutoDiff implements Shorebird's iOS patch pipeline fully locally:
+//
+//  1. Rebuild the app with the bundled Flutter (`flutter build ios
+//     --release --no-codesign`) — an unsigned build is fine since the
+//     Dart snapshot regions are signature-independent.
+//  2. gen_snapshot recompiles app.dill into an ELF AOT snapshot (out.aot).
+//  3. aot-tools `link` minimizes the diff between the release snapshot and
+//     the new one, producing the vmcode the device will run.
+//  4. aot-tools `dump_blobs` extracts the release's snapshot regions —
+//     the same bytes the on-device updater uses as its patch base.
+//  5. Shorebird's `patch` binary diffs (dump_blobs → vmcode).
+//
+// Returns the diff path and sha256(vmcode) — the artifact hash devices
+// verify after applying the patch.
+func runIOSAutoDiff(releaseVersion string, skipBuild bool, channel, appID string) (string, string, error) {
+	// Step 1: build, remembering when it started so we can find the app.dill
+	// it produced (Shorebird looks for an app.dill newer than the build).
+	buildStart := time.Now()
+	if !skipBuild {
+		ui.Info("Building iOS patch with Shorebird's bundled Flutter (--no-codesign)...")
+		if err := shorebird.RunFlutter(".", nil, "build", "ios", "--release", "--no-codesign"); err != nil {
+			return "", "", fmt.Errorf("patch build failed: %w", err)
+		}
+	} else {
+		buildStart = time.Time{} // accept any existing app.dill
+	}
+
+	// Step 2: resolve the toolchain — all local, no Shorebird account.
+	appDill, err := shorebird.FindRecentAppDill(".", buildStart)
+	if err != nil {
+		return "", "", err
+	}
+	// aot-tools runs gen_snapshot with cwd=workDir — the kernel path must
+	// be absolute or it resolves relative to the wrong directory.
+	if appDill, err = filepath.Abs(appDill); err != nil {
+		return "", "", err
+	}
+	ui.Muted("Kernel snapshot: %s", appDill)
+	genSnapshot, err := shorebird.IosEngineTool("gen_snapshot_arm64")
+	if err != nil {
+		return "", "", err
+	}
+	analyzeSnapshot, err := shorebird.IosEngineTool("analyze_snapshot_arm64")
+	if err != nil {
+		return "", "", err
+	}
+	aotTools, err := shorebird.EnsureAotTools()
+	if err != nil {
+		return "", "", err
+	}
+	patchBinary, err := shorebird.EnsurePatchBinary()
+	if err != nil {
+		return "", "", err
+	}
+
+	// Step 3: fetch the release artifact (App + supplements) from AirBuild.
+	cfg := mustLoadConfig()
+	client := api.New(cfg.APIURL, cfg.APIKey)
+	ui.Info("Downloading release %s App binary from AirBuild...", releaseVersion)
+	dlResp, err := client.CodePushFlutterReleaseDownload(appID, releaseVersion, "IOS", "aarch64", channel)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get release download URL: %w", err)
+	}
+
+	workDir, err := os.MkdirTemp("", "airbuild-ios-patch-*")
+	if err != nil {
+		return "", "", err
+	}
+	defer os.RemoveAll(workDir) //nolint:errcheck
+
+	zipPath := filepath.Join(workDir, "release.zip")
+	if err := client.DownloadFile(dlResp.DownloadUrl, zipPath); err != nil {
+		return "", "", fmt.Errorf("failed to download release artifact: %w", err)
+	}
+	releaseDir := filepath.Join(workDir, "release")
+	if err := os.MkdirAll(releaseDir, 0o755); err != nil {
+		return "", "", err
+	}
+	releaseApp, err := shorebird.ExtractIosReleaseArtifact(zipPath, releaseDir)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to extract release artifact: %w", err)
+	}
+	ui.Muted("Release App: %s", releaseApp)
+
+	// Step 4: recompile the kernel into an ELF AOT snapshot.
+	aotOut := filepath.Join(workDir, "out.aot")
+	ui.Info("Compiling AOT snapshot (gen_snapshot)...")
+	if err := shorebird.RunGenSnapshot(genSnapshot, appDill, aotOut); err != nil {
+		return "", "", err
+	}
+
+	// Step 5: place the patch build's link supplements beside out.aot,
+	// renamed to out.* — aot-tools looks them up by snapshot basename.
+	// The release's supplements already sit beside its App binary inside
+	// releaseDir (they were zipped in at release time).
+	supplementDir := shorebird.IosSupplementDir(".")
+	if n, err := shorebird.CopyIosSupplements(supplementDir, workDir, "out"); err != nil {
+		return "", "", err
+	} else if n == 0 {
+		ui.Muted("No link supplements under %s — link percentage may be low", supplementDir)
+	}
+
+	// Step 6: link — produces the vmcode the device will execute.
+	vmcode := filepath.Join(workDir, "out.vmcode")
+	ui.Info("Linking AOT snapshots (aot-tools link)...")
+	if err := shorebird.RunAotTools(aotTools, workDir,
+		"link",
+		"--base="+releaseApp,
+		"--patch="+aotOut,
+		"--analyze-snapshot="+analyzeSnapshot,
+		"--output="+vmcode,
+		"--gen-snapshot="+genSnapshot,
+		"--kernel="+appDill,
+		"--reporter=json",
+		"--redirect-to="+filepath.Join(workDir, "link.jsonl"),
+	); err != nil {
+		return "", "", err
+	}
+
+	// Step 7: diff base = the release's snapshot regions, matching what the
+	// on-device updater extracts from the installed app.
+	diffBase := filepath.Join(workDir, "diff_base")
+	if ok, err := shorebird.AotToolsSupports(aotTools, workDir, "dump_blobs"); err != nil {
+		return "", "", err
+	} else if ok {
+		ui.Info("Generating diff base (aot-tools dump_blobs)...")
+		if err := shorebird.RunAotTools(aotTools, workDir,
+			"dump_blobs",
+			"--analyze-snapshot="+analyzeSnapshot,
+			"--output="+diffBase,
+			"--snapshot="+releaseApp,
+		); err != nil {
+			return "", "", err
+		}
+	} else {
+		return "", "", fmt.Errorf("aot-tools doesn't support dump_blobs — update Shorebird (`shorebird upgrade`) and retry")
+	}
+
+	// Step 8: binary diff + artifact hash (sha256 of the vmcode the device
+	// produces after applying the patch).
+	diffFile, err := os.CreateTemp("", "airbuild-patch-*.diff")
+	if err != nil {
+		return "", "", err
+	}
+	diffPath := diffFile.Name()
+	diffFile.Close() //nolint:errcheck
+	ui.Info("Creating binary diff...")
+	if err := shorebird.CreateDiff(patchBinary, diffBase, vmcode, diffPath); err != nil {
+		return "", "", fmt.Errorf("failed to create diff: %w", err)
+	}
+	if err := shorebird.ValidateDiffFile(diffPath); err != nil {
+		return "", "", fmt.Errorf("generated diff failed validation: %w", err)
+	}
+	artifactHash, err := sha256File(vmcode)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to hash vmcode: %w", err)
+	}
 	ui.Muted("Created diff: %s", diffPath)
 	return diffPath, artifactHash, nil
 }
