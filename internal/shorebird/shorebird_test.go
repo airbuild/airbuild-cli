@@ -1,6 +1,7 @@
 package shorebird
 
 import (
+	"archive/zip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -226,5 +227,119 @@ func TestValidateDiffFileMissing(t *testing.T) {
 	dir := t.TempDir()
 	if err := ValidateDiffFile(filepath.Join(dir, "does-not-exist.patch")); err == nil {
 		t.Fatal("expected an error for a missing file, got nil")
+	}
+}
+
+// writeFakeAPK creates a minimal zip archive containing the given
+// lib/<abi>/libapp.so entries.
+func writeFakeAPK(t *testing.T, path string, libs map[string][]byte) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create apk: %v", err)
+	}
+	defer f.Close() //nolint:errcheck
+	zw := zip.NewWriter(f)
+	for name, content := range libs {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("zip create %s: %v", name, err)
+		}
+		if _, err := w.Write(content); err != nil {
+			t.Fatalf("zip write %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+}
+
+func TestFindAndroidLibappExtractsPackagedLib(t *testing.T) {
+	dir := t.TempDir()
+	apkDir := filepath.Join(dir, "build", "app", "outputs", "flutter-apk")
+	if err := os.MkdirAll(apkDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("packaged stripped libapp bytes")
+	writeFakeAPK(t, filepath.Join(apkDir, "app-release.apk"), map[string][]byte{
+		"lib/arm64-v8a/libapp.so": want,
+	})
+
+	got, err := FindAndroidLibapp(dir, "arm64-v8a")
+	if err != nil {
+		t.Fatalf("FindAndroidLibapp: %v", err)
+	}
+	defer os.Remove(got) //nolint:errcheck
+	data, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatalf("read extracted libapp: %v", err)
+	}
+	if string(data) != string(want) {
+		t.Fatalf("extracted content mismatch: got %q", string(data))
+	}
+}
+
+func TestFindAndroidLibappPrefersPackagedOverIntermediate(t *testing.T) {
+	dir := t.TempDir()
+	// Intermediate (unstripped) variant — should NOT be picked when a
+	// packaged APK exists.
+	intermediate := filepath.Join(dir, "build", "app", "intermediates", "merged_native_libs", "release", "out", "lib", "arm64-v8a")
+	if err := os.MkdirAll(intermediate, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(intermediate, "libapp.so"), []byte("unstripped intermediate"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	apkDir := filepath.Join(dir, "build", "app", "outputs", "flutter-apk")
+	if err := os.MkdirAll(apkDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("packaged")
+	writeFakeAPK(t, filepath.Join(apkDir, "app-release.apk"), map[string][]byte{
+		"lib/arm64-v8a/libapp.so": want,
+	})
+
+	got, err := FindAndroidLibapp(dir, "arm64-v8a")
+	if err != nil {
+		t.Fatalf("FindAndroidLibapp: %v", err)
+	}
+	defer os.Remove(got) //nolint:errcheck
+	data, _ := os.ReadFile(got)
+	if string(data) != string(want) {
+		t.Fatalf("expected packaged bytes, got %q", string(data))
+	}
+}
+
+func TestFindAndroidLibappAmbiguousArch(t *testing.T) {
+	dir := t.TempDir()
+	apkDir := filepath.Join(dir, "build", "app", "outputs", "flutter-apk")
+	if err := os.MkdirAll(apkDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeAPK(t, filepath.Join(apkDir, "app-release.apk"), map[string][]byte{
+		"lib/arm64-v8a/libapp.so":   []byte("a"),
+		"lib/armeabi-v7a/libapp.so": []byte("b"),
+	})
+
+	if _, err := FindAndroidLibapp(dir, ""); err == nil {
+		t.Fatal("expected an error for ambiguous architectures, got nil")
+	}
+}
+
+func TestFindAndroidLibappFallsBackToIntermediates(t *testing.T) {
+	dir := t.TempDir()
+	libDir := filepath.Join(dir, "build", "app", "intermediates", "stripped_native_libs", "release", "out", "lib", "x86_64")
+	if err := os.MkdirAll(libDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(libDir, "libapp.so"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := FindAndroidLibapp(dir, "x86_64")
+	if err != nil {
+		t.Fatalf("FindAndroidLibapp: %v", err)
+	}
+	if filepath.Base(filepath.Dir(got)) != "x86_64" {
+		t.Fatalf("unexpected path: %s", got)
 	}
 }

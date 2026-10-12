@@ -22,6 +22,7 @@ package shorebird
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -350,15 +351,113 @@ func Run(dir string, args ...string) error {
 	return nil
 }
 
-// FindAndroidLibapp scans the standard Flutter/Gradle build output for the
-// compiled libapp.so, returning the first match for the given architecture
-// (e.g. "arm64-v8a"), or the first one found if architecture is empty.
-// Returns an error if none is found — the caller should fall back to
-// requiring an explicit --artifact path.
+// FindAndroidLibapp returns the libapp.so that actually ships to devices
+// for the given architecture (e.g. "arm64-v8a"), by extracting it from the
+// built APK/AAB under build/app/outputs. Using the packaged artifact —
+// not intermediates like merged_native_libs — is required: the on-device
+// updater applies binary diffs to the libapp.so inside the installed APK,
+// which is typically the *stripped* variant and can differ byte-for-byte
+// from the intermediate. A diff or release artifact built from the wrong
+// variant is rejected by the device's hash check.
+//
+// The result is extracted to a temp file the caller may remove. If no
+// archive is found it falls back to scanning intermediates.
 func FindAndroidLibapp(projectDir, architecture string) (string, error) {
+	outputs := []string{
+		filepath.Join(projectDir, "build", "app", "outputs", "flutter-apk", "app-release.apk"),
+		filepath.Join(projectDir, "build", "app", "outputs", "bundle", "release", "app-release.aab"),
+	}
+	for _, archive := range outputs {
+		if path, err := extractPackagedLibapp(archive, architecture); err == nil {
+			return path, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return findIntermediateLibapp(projectDir, architecture)
+}
+
+// extractPackagedLibapp pulls lib/<arch>/libapp.so out of an APK, or
+// base/lib/<arch>/libapp.so out of an AAB. Returns os.ErrNotExist when the
+// archive itself is absent so callers can try the next candidate.
+func extractPackagedLibapp(archivePath, architecture string) (string, error) {
+	if _, err := os.Stat(archivePath); err != nil {
+		return "", err
+	}
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return "", fmt.Errorf("could not read %s: %w", archivePath, err)
+	}
+	defer zr.Close() //nolint:errcheck
+
+	// Collect every lib/<abi>/libapp.so entry (AAB nests under base/).
+	byArch := map[string]*zip.File{}
+	for _, f := range zr.File {
+		parts := strings.Split(strings.TrimPrefix(f.Name, "./"), "/")
+		for i, p := range parts {
+			if p == "lib" && i+2 < len(parts) && parts[i+2] == "libapp.so" {
+				abi := parts[i+1]
+				if architecture == "" || abi == architecture {
+					if _, seen := byArch[abi]; !seen {
+						byArch[abi] = f
+					}
+				}
+				break
+			}
+		}
+	}
+
+	if len(byArch) == 0 {
+		if architecture != "" {
+			return "", fmt.Errorf("lib/%s/libapp.so not found in %s — pass --artifact explicitly", architecture, archivePath)
+		}
+		return "", fmt.Errorf("no packaged libapp.so found in %s — pass --artifact explicitly", archivePath)
+	}
+	var arch string
+	var entry *zip.File
+	if architecture != "" {
+		arch = architecture
+		entry = byArch[arch]
+	} else {
+		if len(byArch) > 1 {
+			arches := make([]string, 0, len(byArch))
+			for a := range byArch {
+				arches = append(arches, a)
+			}
+			return "", fmt.Errorf("multiple architectures in %s (%s) — pass --architecture", archivePath, strings.Join(arches, ", "))
+		}
+		for a, f := range byArch {
+			arch, entry = a, f
+		}
+	}
+	if entry == nil {
+		return "", fmt.Errorf("lib/%s/libapp.so not found in %s — pass --artifact explicitly", arch, archivePath)
+	}
+
+	rc, err := entry.Open()
+	if err != nil {
+		return "", fmt.Errorf("could not read libapp.so from %s: %w", archivePath, err)
+	}
+	defer rc.Close() //nolint:errcheck
+	out, err := os.CreateTemp("", "airbuild-libapp-*.so")
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(out, rc); err != nil {
+		out.Close() //nolint:errcheck
+		return "", fmt.Errorf("could not extract libapp.so: %w", err)
+	}
+	out.Close() //nolint:errcheck
+	return out.Name(), nil
+}
+
+// findIntermediateLibapp scans Gradle intermediates for libapp.so — a
+// fallback when no packaged APK/AAB exists (e.g. --skip-build). Prefers
+// stripped_native_libs since that is what normally lands in the package.
+func findIntermediateLibapp(projectDir, architecture string) (string, error) {
 	candidateRoots := []string{
-		filepath.Join(projectDir, "build", "app", "intermediates", "merged_native_libs"),
 		filepath.Join(projectDir, "build", "app", "intermediates", "stripped_native_libs"),
+		filepath.Join(projectDir, "build", "app", "intermediates", "merged_native_libs"),
 	}
 
 	var found []string
