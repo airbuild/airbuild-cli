@@ -243,7 +243,11 @@ func exitIfFailures(fw setupFramework, actions setup.Checklist, results []setup.
 		return
 	}
 	ui.Warn("%d issue(s) remain — run 'airbuild codepush %s doctor' for details", remaining, fw.Command)
-	ui.Muted("Some items need manual installation (e.g. Dart/Flutter SDK, Node.js)")
+	if fw.Command == "flutter" {
+		ui.Muted("Some items need manual installation (e.g. Dart/Flutter SDK)")
+	} else {
+		ui.Muted("Some items need manual installation (e.g. Node.js, JDK, Android SDK)")
+	}
 
 	owned := map[string]bool{}
 	for _, a := range actions {

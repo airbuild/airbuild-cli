@@ -1382,8 +1382,10 @@ func classifyManifestEntry(platform, name string) string {
 	switch platform {
 	case "ANDROID":
 		switch {
-		case strings.HasPrefix(name, "META-INF/"):
-			return "" // signing output
+		case strings.HasPrefix(name, "META-INF/"),
+			strings.HasPrefix(name, "assets/dexopt/"),
+			strings.HasPrefix(name, "BUNDLE-METADATA/"):
+			return "" // signing output, dexopt profiles, bundle metadata — build churn
 		case strings.HasSuffix(name, "/libapp.so"), name == "libapp.so":
 			return "dart"
 		case strings.HasSuffix(name, "/libflutter.so"), strings.HasSuffix(name, "/libflutter_package.so"):

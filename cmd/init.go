@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -248,7 +249,9 @@ func detectFramework() string {
 	if fileExists("pubspec.yaml") {
 		return "flutter"
 	}
-	if fileExists("react-native.config.js") || fileExists("app.json") && fileExists("package.json") && fileExists("metro.config.js") {
+	if fileExists("react-native.config.js") ||
+		fileExists("app.json") && fileExists("package.json") && fileExists("metro.config.js") ||
+		hasPackageDependency("react-native") || hasPackageDependency("expo") {
 		return "react-native"
 	}
 	if fileExists("app.json") && fileExists("metro.config.js") {
@@ -305,6 +308,28 @@ func defaultAppName() string {
 func fileExists(name string) bool {
 	_, err := os.Stat(name)
 	return err == nil
+}
+
+// hasPackageDependency reports whether package.json lists dep in
+// dependencies or devDependencies. Used to detect RN/Expo projects that
+// don't have a metro.config.js (standard Expo projects don't).
+func hasPackageDependency(dep string) bool {
+	data, err := os.ReadFile("package.json")
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return false
+	}
+	_, ok := pkg.Dependencies[dep]
+	if !ok {
+		_, ok = pkg.DevDependencies[dep]
+	}
+	return ok
 }
 
 // containsPlatform checks if a platform string is in a list.
