@@ -38,6 +38,11 @@ const EVENTS_URL = %q;
 
 const DEVICE_PARAM = 'airbuild-device-id';
 const PENDING_PARAM = 'airbuild-pending-update';
+// A crash during startup must not claim install success — only report
+// launch_success after the bundle has survived a short settle window.
+// If the app dies inside the window the pending marker stays set, so the
+// next boot's emergency_launch still attributes the crash correctly.
+const SETTLE_DELAY_MS = 5000;
 
 function uuid() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
@@ -46,14 +51,24 @@ function uuid() {
   });
 }
 
+// Debug snapshot — readable from JS as globalThis.__airbuildTelemetry.
+globalThis.__airbuildTelemetry = { events: [] };
+function dbg(entry) {
+  try {
+    globalThis.__airbuildTelemetry.events.push(entry);
+  } catch {}
+}
+
 async function post(payload) {
   try {
-    await fetch(EVENTS_URL, {
+    const res = await fetch(EVENTS_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-  } catch {
+    dbg({ ...payload, status: res.status });
+  } catch (e) {
+    dbg({ ...payload, status: 'error', error: String(e) });
     // Telemetry must never affect app behavior.
   }
 }
@@ -89,6 +104,15 @@ try {
 
     const pending = params[PENDING_PARAM] || null;
     const platform = Platform.OS === 'ios' ? 'ios' : Platform.OS === 'android' ? 'android' : undefined;
+    dbg({
+      boot: true,
+      deviceId,
+      pending,
+      updateId: Updates.updateId,
+      isEmbeddedLaunch: Updates.isEmbeddedLaunch,
+      isEmergencyLaunch: Updates.isEmergencyLaunch,
+      isEnabled: Updates.isEnabled,
+    });
 
     if (Updates.isEmergencyLaunch) {
       // The previously-launched update crashed during startup; the
@@ -106,22 +130,50 @@ try {
       return;
     }
 
-    if (!Updates.isEmbeddedLaunch && Updates.updateId) {
-      // Running a downloaded OTA update — it launched successfully.
-      await post({
-        event: 'launch_success',
-        deviceId,
-        updateId: Updates.updateId,
-        platform,
-      });
-      if (pending) Updates.setExtraParamAsync(PENDING_PARAM, null).catch(() => {});
-      return;
+    if (pending && pending !== Updates.updateId) {
+      // A downloaded update was skipped entirely — we booted into a
+      // different bundle (embedded or an older update). That means it
+      // either crashed so early the process died before error recovery
+      // could flag isEmergencyLaunch, or the channel rolled back.
+      // A fresh check tells them apart: a rollBackToEmbedded directive
+      // is benign; anything else means the pending update failed.
+      try {
+        const check = await Updates.checkForUpdateAsync();
+        if (check && check.isRollBackToEmbedded) {
+          Updates.setExtraParamAsync(PENDING_PARAM, null).catch(() => {});
+        } else {
+          await post({
+            event: 'emergency_launch',
+            deviceId,
+            updateId: pending,
+            reason: Updates.emergencyLaunchReason || 'pending_update_never_launched',
+            platform,
+          });
+          Updates.setExtraParamAsync(PENDING_PARAM, null).catch(() => {});
+        }
+      } catch {
+        // Check failed (e.g. offline) — keep the pending marker and
+        // retry on the next boot.
+      }
     }
 
-    // Embedded launch with no emergency — a pending update was
-    // superseded (e.g. a rollBackToEmbedded directive) before it ran.
-    // Not a failure; just clear the marker.
-    if (pending) Updates.setExtraParamAsync(PENDING_PARAM, null).catch(() => {});
+    if (!Updates.isEmbeddedLaunch && Updates.updateId) {
+      // Running a downloaded OTA update — report success only once the
+      // bundle has survived the settle window.
+      const runningUpdateId = Updates.updateId;
+      setTimeout(() => {
+        post({
+          event: 'launch_success',
+          deviceId,
+          updateId: runningUpdateId,
+          platform,
+        });
+        if (pending === runningUpdateId) {
+          Updates.setExtraParamAsync(PENDING_PARAM, null).catch(() => {});
+        }
+      }, SETTLE_DELAY_MS);
+      return;
+    }
   } catch {}
 })();
 `
