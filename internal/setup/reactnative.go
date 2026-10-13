@@ -14,6 +14,7 @@ func ReactNativeChecklist() Checklist {
 		{Name: "npx", Run: checkNpx},
 		{Name: "expo-updates", Run: checkExpoUpdates},
 		{Name: "expo-updates config", Run: checkExpoUpdatesConfig},
+		{Name: "ios bundleIdentifier", Run: checkIOSBundleIdentifier},
 		{Name: ".airbuild.json", Run: checkAirbuildJSON},
 		{Name: "api key", Run: checkAPIKey},
 		{Name: "connectivity", Run: checkConnectivity},
@@ -34,6 +35,8 @@ func ReactNativeInitActions() Checklist {
 		{Name: "expo-updates", Run: checkExpoUpdates, Fix: installExpoUpdates,
 			Modifies: "package.json, lockfile, node_modules"},
 		{Name: "expo-updates config", Run: checkExpoUpdatesConfig, Fix: initExpoUpdatesConfig,
+			Modifies: "app.json"},
+		{Name: "ios bundleIdentifier", Run: checkIOSBundleIdentifier, Fix: fixIOSBundleIdentifier,
 			Modifies: "app.json"},
 	}
 }
@@ -134,6 +137,32 @@ func checkExpoUpdatesConfig() CheckResult {
 		"Run `airbuild codepush react-native init` to configure it")
 }
 
+func checkIOSBundleIdentifier() CheckResult {
+	if !FileExists("app.json") {
+		return Warn("ios bundleIdentifier", "no app.json — iOS bundle ID unchecked",
+			"iOS builds need expo.ios.bundleIdentifier in app.json")
+	}
+	data, err := os.ReadFile("app.json")
+	if err != nil {
+		return Warn("ios bundleIdentifier", err.Error(), "Fix the syntax error in app.json")
+	}
+	var cfg struct {
+		Expo struct {
+			IOS struct {
+				BundleIdentifier string `json:"bundleIdentifier"`
+			} `json:"ios"`
+		} `json:"expo"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Warn("ios bundleIdentifier", err.Error(), "Fix the syntax error in app.json")
+	}
+	if cfg.Expo.IOS.BundleIdentifier != "" {
+		return Passf("ios bundleIdentifier", cfg.Expo.IOS.BundleIdentifier)
+	}
+	return Warn("ios bundleIdentifier", "not set — required before building for iOS",
+		"Run `airbuild codepush react-native init` to derive one automatically")
+}
+
 func appJSONUpdatesURL() (string, error) {
 	data, err := os.ReadFile("app.json")
 	if err != nil {
@@ -168,6 +197,44 @@ func installExpoUpdates() error {
 		return RunCmd(".", "npx", "expo", "install", "expo-updates")
 	}
 	return RunCmd(".", "npm", "install", "expo-updates")
+}
+
+// fixIOSBundleIdentifier derives and writes expo.ios.bundleIdentifier when
+// missing. No-op for app.config.js/ts projects (can't be edited reliably).
+func fixIOSBundleIdentifier() error {
+	if !FileExists("app.json") {
+		return ErrManualAction
+	}
+	data, err := os.ReadFile("app.json")
+	if err != nil {
+		return fmt.Errorf("could not read app.json: %w", err)
+	}
+	var appConfig map[string]interface{}
+	if err := json.Unmarshal(data, &appConfig); err != nil {
+		return fmt.Errorf("could not parse app.json: %w", err)
+	}
+	expo, ok := appConfig["expo"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("app.json has no expo section")
+	}
+	ios, ok := expo["ios"].(map[string]interface{})
+	if !ok {
+		ios = map[string]interface{}{}
+		expo["ios"] = ios
+	}
+	if _, ok := ios["bundleIdentifier"]; ok {
+		return nil
+	}
+	bid := deriveBundleIdentifier(expo)
+	if bid == "" {
+		return fmt.Errorf("could not derive a bundle identifier — set expo.ios.bundleIdentifier manually")
+	}
+	ios["bundleIdentifier"] = bid
+	out, err := json.MarshalIndent(appConfig, "", "  ")
+	if err != nil {
+		return fmt.Errorf("could not encode app.json: %w", err)
+	}
+	return os.WriteFile("app.json", append(out, '\n'), 0644)
 }
 
 func initExpoUpdatesConfig() error {
@@ -239,6 +306,21 @@ func updateAppJSON(manifestURL string) error {
 		expo["runtimeVersion"] = map[string]interface{}{"policy": "appVersion"}
 	}
 
+	// iOS builds fail without a bundleIdentifier. Derive one from
+	// android.package or the app slug — iOS bundle IDs allow only
+	// [A-Za-z0-9.-], so underscores/hyphens-in-segment issues like
+	// "com.anonymous.codepush_rn" must be sanitized.
+	ios, ok := expo["ios"].(map[string]interface{})
+	if !ok {
+		ios = map[string]interface{}{}
+		expo["ios"] = ios
+	}
+	if _, ok := ios["bundleIdentifier"]; !ok {
+		if bid := deriveBundleIdentifier(expo); bid != "" {
+			ios["bundleIdentifier"] = bid
+		}
+	}
+
 	out, err := json.MarshalIndent(appConfig, "", "  ")
 	if err != nil {
 		return fmt.Errorf("could not encode app.json: %w", err)
@@ -247,6 +329,50 @@ func updateAppJSON(manifestURL string) error {
 		return fmt.Errorf("could not write app.json: %w", err)
 	}
 	return nil
+}
+
+// deriveBundleIdentifier builds an iOS-safe bundle ID from android.package
+// (preferred) or the app slug. iOS IDs allow only [A-Za-z0-9.-]; segments
+// must not be empty.
+func deriveBundleIdentifier(expo map[string]interface{}) string {
+	src := ""
+	if android, ok := expo["android"].(map[string]interface{}); ok {
+		if pkg, _ := android["package"].(string); pkg != "" {
+			src = pkg
+		}
+	}
+	if src == "" {
+		slug, _ := expo["slug"].(string)
+		name, _ := expo["name"].(string)
+		switch {
+		case slug != "":
+			src = "com.anonymous." + slug
+		case name != "":
+			src = "com.anonymous." + name
+		default:
+			return ""
+		}
+	}
+	var b strings.Builder
+	for _, r := range src {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+			b.WriteRune(r)
+		}
+	}
+	id := b.String()
+	// Drop empty segments produced by removed characters (e.g. "a_.b").
+	parts := strings.Split(id, ".")
+	kept := parts[:0]
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) < 2 {
+		return ""
+	}
+	return strings.Join(kept, ".")
 }
 
 // printAppConfigSnippet shows what to add to app.config.js/ts, which can't be
@@ -261,6 +387,7 @@ func printAppConfigSnippet(manifestURL string) {
 	fmt.Println("    fallbackToCacheTimeout: 0,")
 	fmt.Println("  },")
 	fmt.Println("  runtimeVersion: { policy: 'appVersion' },")
+	fmt.Println("  ios: { bundleIdentifier: 'com.example.myapp' }, // required for iOS builds")
 	fmt.Println()
 	fmt.Println("Then run `airbuild codepush react-native doctor` to verify.")
 }
