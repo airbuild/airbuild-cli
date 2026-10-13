@@ -601,9 +601,13 @@ var codepushFlutterStatusCmd = &cobra.Command{
 			}
 			rows := make([][]string, 0, len(r.Updates))
 			for _, u := range r.Updates {
+				status := u.Status
+				if u.AutoPaused {
+					status += " (auto-paused)"
+				}
 				rows = append(rows, []string{
 					fmt.Sprintf("#%d", u.PatchNumber),
-					u.Status,
+					status,
 					fmt.Sprintf("%d%%", u.RolloutPercent),
 					u.Channel,
 					u.CreatedAt,
@@ -869,9 +873,13 @@ var codepushReactNativeStatusCmd = &cobra.Command{
 			}
 			rows := make([][]string, 0, len(r.Updates))
 			for _, u := range r.Updates {
+				status := u.Status
+				if u.AutoPaused {
+					status += " (auto-paused)"
+				}
 				rows = append(rows, []string{
 					u.ID,
-					u.Status,
+					status,
 					fmt.Sprintf("%d%%", u.RolloutPercent),
 					u.Channel,
 					fmt.Sprintf("%d", len(u.Assets)),

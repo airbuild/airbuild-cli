@@ -318,6 +318,7 @@ type CodePushUpdate struct {
 	ChecksumSha256 string  `json:"checksumSha256"`
 	FileSizeBytes  string  `json:"fileSizeBytes"`
 	CrashFreeRate  float64 `json:"crashFreeRate"`
+	AutoPaused     bool    `json:"autoPaused"`
 	CreatedAt      string  `json:"createdAt"`
 }
 
@@ -450,6 +451,7 @@ type CodePushReactNativeUpdate struct {
 	Status         string          `json:"status"`
 	RolloutPercent int             `json:"rolloutPercent"`
 	FileSizeBytes  string          `json:"fileSizeBytes"`
+	AutoPaused     bool            `json:"autoPaused"`
 	CreatedAt      string          `json:"createdAt"`
 	Assets         []CodePushAsset `json:"assets"`
 }

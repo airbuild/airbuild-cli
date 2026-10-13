@@ -15,6 +15,7 @@ func ReactNativeChecklist() Checklist {
 		{Name: "expo-updates", Run: checkExpoUpdates},
 		{Name: "expo-updates config", Run: checkExpoUpdatesConfig},
 		{Name: "ios bundleIdentifier", Run: checkIOSBundleIdentifier},
+		{Name: "telemetry module", Run: checkTelemetry},
 		{Name: ".airbuild.json", Run: checkAirbuildJSON},
 		{Name: "api key", Run: checkAPIKey},
 		{Name: "connectivity", Run: checkConnectivity},
@@ -26,6 +27,8 @@ func ReactNativeInstallActions() Checklist {
 	return Checklist{
 		{Name: "expo-updates", Run: checkExpoUpdates, Fix: installExpoUpdates,
 			Modifies: "package.json, lockfile, node_modules"},
+		{Name: "telemetry module", Run: checkTelemetry, Fix: writeTelemetry,
+			Modifies: "airbuild-telemetry.js"},
 	}
 }
 
@@ -38,6 +41,8 @@ func ReactNativeInitActions() Checklist {
 			Modifies: "app.json"},
 		{Name: "ios bundleIdentifier", Run: checkIOSBundleIdentifier, Fix: fixIOSBundleIdentifier,
 			Modifies: "app.json"},
+		{Name: "telemetry module", Run: checkTelemetry, Fix: writeTelemetry,
+			Modifies: "airbuild-telemetry.js"},
 	}
 }
 
