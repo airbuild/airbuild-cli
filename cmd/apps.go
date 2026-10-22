@@ -20,7 +20,11 @@ var appsListCmd = &cobra.Command{
 
 		resp, err := client.ListApps()
 		if err != nil {
-			ui.Error("Failed to list apps: %v", err)
+			fail("Failed to list apps: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
 			return
 		}
 

@@ -12,6 +12,14 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the AirBuild CLI version",
 	Run: func(cmd *cobra.Command, args []string) {
+		if jsonOutput {
+			ui.PrintJSON(map[string]string{
+				"version": cliVersion,
+				"os":      runtime.GOOS,
+				"arch":    runtime.GOARCH,
+			})
+			return
+		}
 		fmt.Printf("AirBuild CLI %s\n", cliVersion)
 		ui.Muted("  %s/%s", runtime.GOOS, runtime.GOARCH)
 	},

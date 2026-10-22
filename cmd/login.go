@@ -18,9 +18,7 @@ var loginCmd = &cobra.Command{
 Get your API key from the AirBuild dashboard under Settings > API Keys.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if loginAPIKey == "" {
-			ui.Error("--api-key is required")
-			cmd.Help()
-			return
+			fail("--api-key is required")
 		}
 
 		// Use provided URL or default
@@ -35,8 +33,7 @@ Get your API key from the AirBuild dashboard under Settings > API Keys.`,
 		client := api.New(baseURL, loginAPIKey)
 		resp, err := client.Verify()
 		if err != nil {
-			ui.Error("Authentication failed: %v", err)
-			return
+			fail("Authentication failed: %v", err)
 		}
 
 		// Save config
@@ -47,7 +44,16 @@ Get your API key from the AirBuild dashboard under Settings > API Keys.`,
 			OrgName: resp.Organization.Name,
 		}
 		if err := cfg.Save(); err != nil {
-			ui.Error("Could not save config: %v", err)
+			fail("Could not save config: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(map[string]interface{}{
+				"loggedIn":     true,
+				"apiUrl":       baseURL,
+				"organization": resp.Organization,
+				"apiKeyId":     resp.APIKeyID,
+			})
 			return
 		}
 

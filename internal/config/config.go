@@ -19,6 +19,17 @@ type Config struct {
 // DefaultAPIURL is the default AirBuild API base URL.
 const DefaultAPIURL = "https://airbuild.dev"
 
+// Environment variables that override the config file. Env vars take
+// precedence over ~/.airbuild/config.json — this is the canonical way to
+// authenticate in CI/CD and AI-agent environments where no interactive
+// `airbuild login` has run.
+const (
+	// EnvAPIKey supplies the API key (airbuild_xxx).
+	EnvAPIKey = "AIRBUILD_API_KEY"
+	// EnvAPIURL overrides the API base URL (self-hosted/staging).
+	EnvAPIURL = "AIRBUILD_API_URL"
+)
+
 // configDir returns the directory for the AirBuild CLI config.
 func configDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -37,9 +48,28 @@ func configPath() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
-// Load reads the config from disk. Returns an empty config if the file
-// does not exist (not an error — the user may not have logged in yet).
+// LoadFile reads the persisted config from disk only — environment
+// variables are NOT applied. Use this when editing and saving the file
+// (e.g. `config set`) so env overrides don't leak into ~/.airbuild/config.json.
+func LoadFile() (*Config, error) {
+	return load()
+}
+
+// Load reads the config from disk and applies environment overrides
+// (AIRBUILD_API_KEY / AIRBUILD_API_URL win over the file). Returns an
+// empty config if the file does not exist (not an error — the user may
+// not have logged in yet).
 func Load() (*Config, error) {
+	cfg, err := load()
+	if err != nil {
+		return nil, err
+	}
+	applyEnvOverrides(cfg)
+	return cfg, nil
+}
+
+// load reads the config from disk without env overrides.
+func load() (*Config, error) {
 	path, err := configPath()
 	if err != nil {
 		return nil, err
@@ -61,6 +91,18 @@ func Load() (*Config, error) {
 		cfg.APIURL = DefaultAPIURL
 	}
 	return &cfg, nil
+}
+
+// applyEnvOverrides lets environment variables win over the config file.
+// AIRBUILD_API_KEY/AIRBUILD_API_URL make `airbuild` fully non-interactive —
+// no `login` needed when they're set.
+func applyEnvOverrides(cfg *Config) {
+	if v := os.Getenv(EnvAPIKey); v != "" {
+		cfg.APIKey = v
+	}
+	if v := os.Getenv(EnvAPIURL); v != "" {
+		cfg.APIURL = v
+	}
 }
 
 // Save writes the config to disk, creating the directory if needed.

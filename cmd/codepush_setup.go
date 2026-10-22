@@ -147,7 +147,7 @@ func printResults(results []setup.CheckResult) {
 		}
 		switch r.Status {
 		case setup.StatusPass:
-			fmt.Printf("  %s %s\n", r.Status, msg)
+			ui.Printf("  %s %s\n", r.Status, msg)
 		case setup.StatusWarn:
 			ui.Warn("%s %s", r.Status, msg)
 		case setup.StatusFail:
@@ -158,14 +158,14 @@ func printResults(results []setup.CheckResult) {
 
 func runDoctor(fw setupFramework, checks setup.Checklist) {
 	ui.Header("%s CodePush — Environment Check", fw.Name)
-	fmt.Println()
+	ui.Println("")
 
 	results := checks.Evaluate()
 	printResults(results)
 	failures := setup.CountFailures(results)
 	warnings := setup.CountWarnings(results)
 
-	fmt.Println()
+	ui.Println("")
 	if failures == 0 && warnings == 0 {
 		ui.Success("All checks passed — %s CodePush is ready to use", fw.Name)
 		return
@@ -182,9 +182,12 @@ func runDoctor(fw setupFramework, checks setup.Checklist) {
 // user, applies them, then re-checks. Exits 1 if anything remains broken.
 func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullChecklist setup.Checklist) {
 	yes, _ := cmd.Flags().GetBool("yes")
+	if yes {
+		assumeYes = true
+	}
 	title := map[string]string{"install": "Install Dependencies", "init": "Initialize Project"}[verb]
 	ui.Header("%s CodePush — %s", fw.Name, title)
-	fmt.Println()
+	ui.Println("")
 
 	results := fullChecklist.Evaluate()
 	printResults(results)
@@ -200,25 +203,25 @@ func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullC
 		}
 	}
 
-	fmt.Println()
+	ui.Println("")
 	if len(toFix) == 0 {
 		ui.Success("Nothing to %s — everything this command manages is already set up", verb)
 		exitIfFailures(fw, actions, fullChecklist.Evaluate())
 		return
 	}
 
-	fmt.Println("The following changes will be made:")
+	ui.Println("The following changes will be made:")
 	for _, c := range toFix {
-		fmt.Printf("  - %s (modifies %s)\n", c.Name, c.Modifies)
+		ui.Printf("  - %s (modifies %s)\n", c.Name, c.Modifies)
 	}
-	fmt.Println()
-	if !yes && !confirm("Proceed?") {
+	ui.Println("")
+	if !yes && !confirm("Proceed?", true) {
 		ui.Muted("Aborted — no changes made")
 		os.Exit(1)
 	}
 
 	for _, c := range toFix {
-		fmt.Println()
+		ui.Println("")
 		ui.Info("Setting up %s...", c.Name)
 		switch err := c.Fix(); {
 		case errors.Is(err, setup.ErrManualAction):
@@ -230,7 +233,7 @@ func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullC
 		}
 	}
 
-	fmt.Println()
+	ui.Println("")
 	exitIfFailures(fw, actions, fullChecklist.Evaluate())
 }
 

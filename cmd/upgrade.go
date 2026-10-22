@@ -19,6 +19,7 @@ import (
 const GitHubRepo = "airbuild/airbuild-cli"
 
 var upgradeCheck bool
+var upgradeYes bool
 
 var upgradeCmd = &cobra.Command{
 	Use:   "upgrade",
@@ -32,12 +33,14 @@ Examples:
   airbuild upgrade           # Upgrade to latest version
   airbuild upgrade --check   # Only check if an update is available`,
 	Run: func(cmd *cobra.Command, args []string) {
+		assumeYes = upgradeYes
 		runUpgrade()
 	},
 }
 
 func init() {
 	upgradeCmd.Flags().BoolVar(&upgradeCheck, "check", false, "Only check if an update is available (don't upgrade)")
+	upgradeCmd.Flags().BoolVar(&upgradeYes, "yes", false, "Non-interactive: answer yes to prompts")
 	rootCmd.AddCommand(upgradeCmd)
 }
 
@@ -58,7 +61,7 @@ func runUpgrade() {
 	if currentVersion == "dev" {
 		ui.Warn("You're running a development build (version unknown).")
 		if !upgradeCheck {
-			if !confirm("Upgrade to the latest release anyway?") {
+			if !confirm("Upgrade to the latest release anyway?", true) {
 				ui.Info("Aborted.")
 				return
 			}
@@ -69,9 +72,8 @@ func runUpgrade() {
 	ui.Info("Checking for updates...")
 	latest, err := fetchLatestRelease()
 	if err != nil {
-		ui.Error("Could not check for updates: %v", err)
 		ui.Muted("You can manually download from https://github.com/%s/releases", GitHubRepo)
-		return
+		fail("Could not check for updates: %v", err)
 	}
 
 	// Parse version from tag (cli-v1.1.0 → v1.1.0)
@@ -99,19 +101,17 @@ func runUpgrade() {
 	assetName := buildAssetName()
 	asset := findAsset(latest, assetName)
 	if asset == nil {
-		ui.Error("No binary found for %s in release %s", assetName, latestVersion)
 		ui.Muted("Available assets:")
 		for _, a := range latest.Assets {
 			ui.Muted("  %s", a.Name)
 		}
-		return
+		fail("No binary found for %s in release %s", assetName, latestVersion)
 	}
 
 	// Find the current binary path
 	binaryPath, err := os.Executable()
 	if err != nil {
-		ui.Error("Could not determine current binary path: %v", err)
-		return
+		fail("Could not determine current binary path: %v", err)
 	}
 	binaryPath, _ = filepath.EvalSymlinks(binaryPath)
 
@@ -120,17 +120,15 @@ func runUpgrade() {
 	// Download to a temp file
 	tmpPath := binaryPath + ".new"
 	if err := downloadFile(asset.BrowserDownloadURL, tmpPath); err != nil {
-		ui.Error("Download failed: %v", err)
 		os.Remove(tmpPath)
-		return
+		fail("Download failed: %v", err)
 	}
 
 	// Make it executable (Unix only)
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(tmpPath, 0755); err != nil {
-			ui.Error("Could not make binary executable: %v", err)
 			os.Remove(tmpPath)
-			return
+			fail("Could not make binary executable: %v", err)
 		}
 	}
 
@@ -141,18 +139,16 @@ func runUpgrade() {
 	// On Windows, we can't rename a running binary directly.
 	// Rename the current binary to .old first, then move the new one in.
 	if err := os.Rename(binaryPath, backupPath); err != nil {
-		ui.Error("Could not backup current binary: %v", err)
 		os.Remove(tmpPath)
-		return
+		fail("Could not backup current binary: %v", err)
 	}
 
 	// Move new binary into place
 	if err := os.Rename(tmpPath, binaryPath); err != nil {
 		// Restore the old binary
 		os.Rename(backupPath, binaryPath)
-		ui.Error("Could not install new binary: %v", err)
 		os.Remove(tmpPath)
-		return
+		fail("Could not install new binary: %v", err)
 	}
 
 	// Clean up backup (best effort)

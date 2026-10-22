@@ -18,8 +18,7 @@ var buildsListCmd = &cobra.Command{
 	Short: "List builds for an app",
 	Run: func(cmd *cobra.Command, args []string) {
 		if buildsAppID == "" {
-			ui.Error("--app-id is required. Run `airbuild apps list` to see your apps.")
-			return
+			fail("--app-id is required. Run `airbuild apps list` to see your apps.")
 		}
 
 		cfg := mustLoadConfig()
@@ -27,7 +26,11 @@ var buildsListCmd = &cobra.Command{
 
 		resp, err := client.ListBuilds(buildsAppID)
 		if err != nil {
-			ui.Error("Failed to list builds: %v", err)
+			fail("Failed to list builds: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
 			return
 		}
 

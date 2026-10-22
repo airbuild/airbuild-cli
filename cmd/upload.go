@@ -34,15 +34,13 @@ Examples:
 		// Validate file exists
 		info, err := os.Stat(filePath)
 		if err != nil {
-			ui.Error("File not found: %s", filePath)
-			return
+			fail("File not found: %s", filePath)
 		}
 
 		// Validate file extension
 		ext := strings.ToLower(filepath.Ext(filePath))
 		if ext != ".ipa" && ext != ".apk" {
-			ui.Error("File must be .ipa or .apk, got: %s", ext)
-			return
+			fail("File must be .ipa or .apk, got: %s", ext)
 		}
 
 		// Auto-detect platform if not specified
@@ -56,14 +54,12 @@ Examples:
 		} else {
 			platform = strings.ToUpper(platform)
 			if platform != "IOS" && platform != "ANDROID" {
-				ui.Error("Invalid platform: %s (must be IOS or ANDROID)", platform)
-				return
+				fail("Invalid platform: %s (must be IOS or ANDROID)", platform)
 			}
 		}
 
 		if uploadAppID == "" {
-			ui.Error("--app-id is required. Run `airbuild apps list` to see your apps.")
-			return
+			fail("--app-id is required. Run `airbuild apps list` to see your apps.")
 		}
 
 		cfg := mustLoadConfig()
@@ -76,10 +72,14 @@ Examples:
 		start := time.Now()
 		resp, err := client.Upload(filePath, uploadAppID, platform, uploadReleaseNotes)
 		if err != nil {
-			ui.Error("Upload failed: %v", err)
-			return
+			fail("Upload failed: %v", err)
 		}
 		elapsed := time.Since(start).Round(time.Millisecond)
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
+			return
+		}
 
 		ui.Success("Upload complete in %s", elapsed)
 		fmt.Println()

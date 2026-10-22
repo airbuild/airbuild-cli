@@ -1,8 +1,6 @@
 package cmd
 
 import (
-	"fmt"
-
 	"github.com/airbuild/airbuild-cli/internal/config"
 	"github.com/airbuild/airbuild-cli/internal/ui"
 	"github.com/spf13/cobra"
@@ -22,8 +20,7 @@ var configShowCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		cfg, err := config.Load()
 		if err != nil {
-			ui.Error("Could not load config: %v", err)
-			return
+			fail("Could not load config: %v", err)
 		}
 
 		ui.Header("Configuration")
@@ -35,6 +32,16 @@ var configShowCmd = &cobra.Command{
 			} else {
 				apiKeyDisplay = cfg.APIKey
 			}
+		}
+		if jsonOutput {
+			ui.PrintJSON(map[string]string{
+				"apiUrl":  cfg.APIURL,
+				"apiKey":  apiKeyDisplay,
+				"orgId":   cfg.OrgID,
+				"orgName": cfg.OrgName,
+				"appId":   cfg.AppID,
+			})
+			return
 		}
 		ui.Table(
 			[]string{"Key", "Value"},
@@ -58,10 +65,12 @@ Examples:
   airbuild config set --api-key airbuild_xxx
   airbuild config set --api-url https://staging.airbuild.dev`,
 	Run: func(cmd *cobra.Command, args []string) {
-		cfg, err := config.Load()
+		// LoadFile, not Load — env overrides must never be persisted to
+		// the config file (AIRBUILD_API_KEY would otherwise be written
+		// to disk when the user only intended to change the URL).
+		cfg, err := config.LoadFile()
 		if err != nil {
-			ui.Error("Could not load config: %v", err)
-			return
+			fail("Could not load config: %v", err)
 		}
 
 		changed := false
@@ -75,13 +84,11 @@ Examples:
 		}
 
 		if !changed {
-			ui.Error("No values to set. Use --api-key or --api-url.")
-			return
+			fail("No values to set. Use --api-key or --api-url.")
 		}
 
 		if err := cfg.Save(); err != nil {
-			ui.Error("Could not save config: %v", err)
-			return
+			fail("Could not save config: %v", err)
 		}
 
 		ui.Success("Configuration updated")
@@ -97,5 +104,4 @@ func init() {
 
 	// Suppress the default completion command
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
-	_ = fmt.Sprintf // avoid unused import if fmt is not used elsewhere
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/airbuild/airbuild-cli/internal/agents"
 	"github.com/airbuild/airbuild-cli/internal/api"
 	"github.com/airbuild/airbuild-cli/internal/project"
 	"github.com/airbuild/airbuild-cli/internal/ui"
@@ -15,6 +16,12 @@ import (
 )
 
 var initAppID string
+var initYes bool
+var initAgents bool
+
+// assumeYes makes every prompt()/confirm() return its default without
+// reading stdin — set by --yes on interactive commands (init, upgrade).
+var assumeYes bool
 
 var initCmd = &cobra.Command{
 	Use:   "init",
@@ -31,15 +38,20 @@ Android native, iOS native).
 
 Examples:
   airbuild init                    # Interactive setup
-  airbuild init --app-id clxxxx    # Link an existing app`,
+  airbuild init --app-id clxxxx    # Link an existing app
+  airbuild init --yes --agents     # Non-interactive, defaults + AI assistant files`,
 	Run: func(cmd *cobra.Command, args []string) {
+		assumeYes = initYes
+
 		cfg := mustLoadConfig()
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		// Check if config already exists
 		if project.Exists() {
 			ui.Warn(".airbuild.json already exists in this directory.")
-			if !confirm("Overwrite it?") {
+			// --yes defaults this to "no" — init never clobbers an
+			// existing config non-interactively.
+			if !confirm("Overwrite it?", false) {
 				ui.Info("Aborted.")
 				return
 			}
@@ -54,8 +66,7 @@ Examples:
 			ui.Info("Looking up app %s...", appID)
 			apps, err := client.ListApps()
 			if err != nil {
-				ui.Error("Failed to list apps: %v", err)
-				return
+				fail("Failed to list apps: %v", err)
 			}
 			found := false
 			for _, a := range apps.Apps {
@@ -66,15 +77,14 @@ Examples:
 				}
 			}
 			if !found {
-				ui.Error("App not found: %s (make sure it belongs to your organization)", appID)
-				return
+				fail("App not found: %s (make sure it belongs to your organization)", appID)
 			}
 			ui.Success("Found app: %s", app.Name)
 		} else {
 			// Ask: new or existing?
 			ui.Info("Do you want to link an existing app or create a new one?")
-			fmt.Println("  1. Link an existing app")
-			fmt.Println("  2. Create a new app")
+			ui.Println("  1. Link an existing app")
+			ui.Println("  2. Create a new app")
 			choice := prompt("Enter choice (1 or 2)", "1")
 
 			if choice == "1" {
@@ -82,23 +92,20 @@ Examples:
 				ui.Info("Fetching your apps...")
 				apps, err := client.ListApps()
 				if err != nil {
-					ui.Error("Failed to list apps: %v", err)
-					return
+					fail("Failed to list apps: %v", err)
 				}
 				if len(apps.Apps) == 0 {
-					ui.Error("No apps found in your organization. Create one first or choose option 2.")
-					return
+					fail("No apps found in your organization. Create one first or choose option 2.")
 				}
-				fmt.Println()
+				ui.Println("")
 				for i, a := range apps.Apps {
 					platforms := strings.Join(a.Platforms, ", ")
-					fmt.Printf("  %d. %s (%s) [%s]\n", i+1, a.Name, a.ID, platforms)
+					ui.Printf("  %d. %s (%s) [%s]\n", i+1, a.Name, a.ID, platforms)
 				}
-				fmt.Println()
+				ui.Println("")
 				idx := promptInt("Select app number", 1)
 				if idx < 1 || idx > len(apps.Apps) {
-					ui.Error("Invalid selection")
-					return
+					fail("Invalid selection")
 				}
 				app = apps.Apps[idx-1]
 				appID = app.ID
@@ -107,14 +114,13 @@ Examples:
 				// Create new app
 				name := prompt("App name", defaultAppName())
 				if name == "" {
-					ui.Error("App name is required")
-					return
+					fail("App name is required")
 				}
 
 				ui.Info("Which platforms does this app support?")
-				fmt.Println("  1. Android only")
-				fmt.Println("  2. iOS only")
-				fmt.Println("  3. Both Android and iOS")
+				ui.Println("  1. Android only")
+				ui.Println("  2. iOS only")
+				ui.Println("  3. Both Android and iOS")
 				platChoice := prompt("Enter choice (1, 2, or 3)", "3")
 
 				var platforms []string
@@ -130,15 +136,13 @@ Examples:
 				ui.Info("Creating app '%s'...", name)
 				resp, err := client.CreateApp(name, platforms)
 				if err != nil {
-					ui.Error("Failed to create app: %v", err)
-					return
+					fail("Failed to create app: %v", err)
 				}
 				app = resp.App
 				appID = app.ID
 				ui.Success("Created app: %s (%s)", app.Name, appID)
 			} else {
-				ui.Error("Invalid choice")
-				return
+				fail("Invalid choice")
 			}
 		}
 
@@ -158,7 +162,7 @@ Examples:
 		if containsPlatform(app.Platforms, "ANDROID") {
 			ui.Info("")
 			ui.Header("Android Build Paths")
-			if confirm("Configure Android build paths?") {
+			if confirm("Configure Android build paths?", true) {
 				debugDefault, releaseDefault := defaultBuildPaths(framework, "android")
 				debugPath := prompt("Debug APK path", debugDefault)
 				releasePath := prompt("Release APK path", releaseDefault)
@@ -173,7 +177,7 @@ Examples:
 		if containsPlatform(app.Platforms, "IOS") {
 			ui.Info("")
 			ui.Header("iOS Build Paths")
-			if confirm("Configure iOS build paths?") {
+			if confirm("Configure iOS build paths?", true) {
 				debugDefault, releaseDefault := defaultBuildPaths(framework, "ios")
 				debugPath := prompt("Debug IPA path", debugDefault)
 				releasePath := prompt("Release IPA path", releaseDefault)
@@ -186,12 +190,24 @@ Examples:
 
 		// Save config
 		if err := projCfg.Save(); err != nil {
-			ui.Error("Failed to save config: %v", err)
-			return
+			fail("Failed to save config: %v", err)
 		}
 
 		ui.Info("")
 		ui.Success("Created %s", project.ConfigFile)
+
+		// AI assistant files are opt-in: --agents writes them
+		// non-interactively, interactive users are asked. --yes alone
+		// does not create files the user didn't request.
+		if initAgents || (!initYes && confirm("Write AI assistant files (AGENTS.md, CLAUDE.md)?", true)) {
+			written, err := agents.WriteAll(".")
+			if err != nil {
+				ui.Warn("Could not write agent files: %v", err)
+			} else {
+				ui.Success("Wrote AI assistant docs: %s", strings.Join(written, ", "))
+			}
+		}
+
 		ui.Info("")
 		ui.Info("You can now upload builds with:")
 		ui.Muted("  airbuild push")
@@ -202,6 +218,8 @@ Examples:
 
 func init() {
 	initCmd.Flags().StringVar(&initAppID, "app-id", "", "Link an existing app by ID")
+	initCmd.Flags().BoolVar(&initYes, "yes", false, "Non-interactive: answer yes to prompts and accept all defaults")
+	initCmd.Flags().BoolVar(&initAgents, "agents", false, "Write AI assistant files (AGENTS.md, CLAUDE.md) without asking")
 	rootCmd.AddCommand(initCmd)
 }
 
@@ -210,12 +228,17 @@ func init() {
 // reader is a shared bufio reader for stdin prompts.
 var reader = bufio.NewReader(os.Stdin)
 
-// prompt reads a line from stdin with a label and default value.
+// prompt reads a line from stdin with a label and default value. With
+// assumeYes set (--yes), it returns the default without reading stdin.
 func prompt(label, defaultVal string) string {
+	if assumeYes {
+		ui.Printf("%s: %s (auto)\n", label, defaultVal)
+		return defaultVal
+	}
 	if defaultVal != "" {
-		fmt.Printf("%s [%s]: ", label, defaultVal)
+		ui.Printf("%s [%s]: ", label, defaultVal)
 	} else {
-		fmt.Printf("%s: ", label)
+		ui.Printf("%s: ", label)
 	}
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -236,12 +259,25 @@ func promptInt(label string, defaultVal int) int {
 	return n
 }
 
-// confirm asks a yes/no question.
-func confirm(label string) bool {
-	fmt.Printf("%s [Y/n]: ", label)
+// confirm asks a yes/no question. With assumeYes set (--yes), it answers
+// with the given default without reading stdin — callers pass false for
+// destructive actions so --yes stays safe.
+func confirm(label string, defaultVal bool) bool {
+	hint := "[y/N]"
+	if defaultVal {
+		hint = "[Y/n]"
+	}
+	if assumeYes {
+		ui.Printf("%s %s: %v (auto)\n", label, hint, defaultVal)
+		return defaultVal
+	}
+	ui.Printf("%s %s: ", label, hint)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(strings.ToLower(line))
-	return line == "" || line == "y" || line == "yes"
+	if line == "" {
+		return defaultVal
+	}
+	return line == "y" || line == "yes"
 }
 
 // detectFramework checks for framework-specific files in the current directory.

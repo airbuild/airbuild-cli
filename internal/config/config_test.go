@@ -82,6 +82,44 @@ func TestLoadFillsInDefaultAPIURLWhenMissing(t *testing.T) {
 	}
 }
 
+func TestEnvOverridesConfigFile(t *testing.T) {
+	withTempHome(t)
+	t.Setenv(EnvAPIKey, "airbuild_env_key")
+	t.Setenv(EnvAPIURL, "https://selfhosted.example.com")
+
+	cfg := &Config{APIKey: "airbuild_file_key", APIURL: "https://airbuild.dev"}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if loaded.APIKey != "airbuild_env_key" {
+		t.Errorf("APIKey = %q, want env var to win", loaded.APIKey)
+	}
+	if loaded.APIURL != "https://selfhosted.example.com" {
+		t.Errorf("APIURL = %q, want env var to win", loaded.APIURL)
+	}
+	if !loaded.IsLoggedIn() {
+		t.Error("IsLoggedIn() = false with env key set, want true")
+	}
+}
+
+func TestEnvAPIKeyLogsInWithoutConfigFile(t *testing.T) {
+	withTempHome(t)
+	t.Setenv(EnvAPIKey, "airbuild_env_key")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !cfg.IsLoggedIn() {
+		t.Error("IsLoggedIn() = false with AIRBUILD_API_KEY set and no config file")
+	}
+}
+
 func TestLoadInvalidJSON(t *testing.T) {
 	home := withTempHome(t)
 

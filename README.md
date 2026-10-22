@@ -94,12 +94,29 @@ airbuild login --api-key airbuild_xxx
 airbuild login --api-key airbuild_xxx --api-url https://staging.airbuild.dev
 ```
 
+Or skip `login` entirely — `AIRBUILD_API_KEY` (and optionally
+`AIRBUILD_API_URL` for self-hosted) authenticate every command:
+
+```bash
+export AIRBUILD_API_KEY=airbuild_xxx
+```
+
+### Machine-readable output (`--json`)
+
+Every command accepts `--json`: stdout carries only JSON while progress
+and errors go to stderr, and failures exit non-zero. Use it in scripts,
+CI, and AI agents. `init` and `upgrade` also accept `--yes` for
+non-interactive runs; `init --agents` writes `AGENTS.md`/`CLAUDE.md`
+instruction files so coding agents know how to use AirBuild.
+
 ### `airbuild init`
 Create a `.airbuild.json` config file for your project. Enables `airbuild push`.
 
 ```bash
 airbuild init                    # Interactive setup
 airbuild init --app-id app_xxx   # Link an existing app
+airbuild init --yes              # Non-interactive: accept all defaults
+airbuild init --agents           # Also write AGENTS.md/CLAUDE.md for AI assistants
 ```
 
 The interactive flow detects your framework (Flutter, React Native, Android

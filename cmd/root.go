@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/airbuild/airbuild-cli/internal/config"
+	"github.com/airbuild/airbuild-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -18,6 +19,11 @@ func SetVersion(v string) {
 }
 
 // rootCmd is the entry point for the AirBuild CLI.
+// jsonOutput is bound to the global --json flag. When set, human output is
+// routed to stderr and stdout carries only machine-readable JSON — the
+// mode agents and CI pipelines should always use.
+var jsonOutput bool
+
 var rootCmd = &cobra.Command{
 	Use:   "airbuild",
 	Short: "AirBuild CLI — upload builds and manage apps from the terminal",
@@ -25,14 +31,27 @@ var rootCmd = &cobra.Command{
 to AirBuild and managing your apps, builds, and install links.
 
 Quick start:
-  airbuild login --api-key airbuild_xxx
+  airbuild login --api-key airbuild_xxx   # or: export AIRBUILD_API_KEY=airbuild_xxx
   airbuild init                    # Set up project config (.airbuild.json)
   airbuild push                    # Upload build using project config
 
 Or upload a file directly:
-  airbuild upload ./app-release.apk --app-id app_xxx`,
+  airbuild upload ./app-release.apk --app-id app_xxx
+
+Scripting / AI agents: pass --json to any command for machine-readable
+stdout (progress and errors go to stderr).`,
 	SilenceUsage: true,
 	Version:      cliVersion,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		if jsonOutput {
+			ui.SetJSONMode(true)
+		}
+	},
+}
+
+func init() {
+	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false,
+		"Output machine-readable JSON on stdout (logs/errors go to stderr)")
 }
 
 // Execute runs the root command.
@@ -50,8 +69,16 @@ func mustLoadConfig() *config.Config {
 		os.Exit(1)
 	}
 	if !cfg.IsLoggedIn() {
-		fmt.Fprintln(os.Stderr, "Not logged in. Run `airbuild login --api-key airbuild_xxx` first.")
+		fmt.Fprintln(os.Stderr, "Not logged in. Run `airbuild login --api-key airbuild_xxx` first, or set AIRBUILD_API_KEY.")
 		os.Exit(1)
 	}
 	return cfg
+}
+
+// fail prints an error to stderr and exits non-zero. Commands use this
+// instead of `ui.Error(...) + return` so scripts and agents can detect
+// failure from the exit code.
+func fail(format string, args ...interface{}) {
+	ui.Error(format, args...)
+	os.Exit(1)
 }

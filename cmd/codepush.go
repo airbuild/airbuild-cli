@@ -102,24 +102,21 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		platformArg := strings.ToLower(args[0])
 		platform, err := normalizeFlutterPlatform(platformArg)
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 
 		var ok bool
 		cpReleaseAppID, ok = resolveAppID(cpReleaseAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 		if cpReleaseVersion == "" {
-			ui.Error("--version is required")
-			return
+			fail("--version is required")
 		}
 		switch cpReleaseFormat {
 		case "apk", "aab", "appbundle":
 		default:
-			ui.Error("--format must be apk or aab, got: %s", cpReleaseFormat)
-			return
+			fail("--format must be apk or aab, got: %s", cpReleaseFormat)
 		}
 
 		artifact := cpReleaseArtifact
@@ -130,8 +127,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		if artifact == "" {
 			if !cpReleaseSkipBuild {
 				if _, err := shorebird.BundledFlutter(); err != nil {
-					ui.Error("%v", err)
-					return
+					fail("%v", err)
 				}
 				if platform == "ANDROID" {
 					target := "apk"
@@ -141,8 +137,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 					ui.Info("Building %s with Shorebird's bundled Flutter (fully local — no Shorebird account needed)...", target)
 					buildArgs := append([]string{"build", target, "--release"}, dartDefineArgs()...)
 					if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), buildArgs...); err != nil {
-						ui.Error("%v", err)
-						return
+						fail("%v", err)
 					}
 				} else {
 					// iOS: the release artifact MUST come from the exact
@@ -156,16 +151,14 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 						ui.Info("Building iOS app with Shorebird's bundled Flutter (--no-codesign)...")
 						buildArgs := append([]string{"build", "ios", "--release", "--no-codesign"}, dartDefineArgs()...)
 						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), buildArgs...); err != nil {
-							ui.Error("%v", err)
-							return
+							fail("%v", err)
 						}
 						ui.Muted("Note: sign/install the .app this build produced — patches can't apply to a separately-built binary.")
 					} else {
 						ui.Info("Building signed iOS app with Shorebird's bundled Flutter...")
 						buildArgs := append([]string{"build", "ios", "--release"}, dartDefineArgs()...)
 						if err := shorebird.RunFlutter(".", patchSigningEnv(cpReleaseAppID), buildArgs...); err != nil {
-							ui.Error("%v", err)
-							return
+							fail("%v", err)
 						}
 					}
 				}
@@ -173,8 +166,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 			if platform == "ANDROID" {
 				libapps, err := shorebird.FindAndroidLibapps(".")
 				if err != nil {
-					ui.Error("%v", err)
-					return
+					fail("%v", err)
 				}
 				var arches []string
 				for a := range libapps {
@@ -183,8 +175,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 				sort.Strings(arches)
 				if cpReleaseArchitecture != "" {
 					if _, ok := libapps[cpReleaseArchitecture]; !ok {
-						ui.Error("architecture %s not in build (found: %s)", cpReleaseArchitecture, strings.Join(arches, ", "))
-						return
+						fail("architecture %s not in build (found: %s)", cpReleaseArchitecture, strings.Join(arches, ", "))
 					}
 					arches = []string{cpReleaseArchitecture}
 				}
@@ -198,8 +189,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 				// time), the same layout Shorebird stores per-release.
 				packed, err := packageIosReleaseArtifact("", ".")
 				if err != nil {
-					ui.Error("%v", err)
-					return
+					fail("%v", err)
 				}
 				artifact = packed
 				ui.Muted("Packaged iOS release artifact: %s", artifact)
@@ -212,8 +202,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 			// App binaries — repackage into the zip layout patch expects.
 			packed, err := packageIosReleaseArtifact(artifact, ".")
 			if err != nil {
-				ui.Error("%v", err)
-				return
+				fail("%v", err)
 			}
 			artifact = packed
 			if cpReleaseArchitecture == "" {
@@ -223,8 +212,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 
 		if len(uploads) == 0 {
 			if _, err := os.Stat(artifact); err != nil {
-				ui.Error("Artifact not found: %s", artifact)
-				return
+				fail("Artifact not found: %s", artifact)
 			}
 			uploads = []archUpload{{arch: cpReleaseArchitecture, path: artifact}}
 		}
@@ -248,8 +236,7 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 				cpReleaseFlutterRevision, cpReleaseShorebirdAppID, cpReleaseChannel, cpReleaseNotes,
 			)
 			if err != nil {
-				ui.Error("Failed to register release: %v", err)
-				return
+				fail("Failed to register release: %v", err)
 			}
 		}
 
@@ -260,6 +247,11 @@ var codepushFlutterReleaseCmd = &cobra.Command{
 		if !cpReleaseSkipBuild && cpReleaseArtifact == "" {
 			writeBuildManifest(".", platform, cpReleaseVersion)
 			writeDefinesManifest(".", platform, cpReleaseVersion)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
+			return
 		}
 
 		ui.Success("Release registered")
@@ -311,18 +303,16 @@ var codepushFlutterPatchCmd = &cobra.Command{
 		platformArg := strings.ToLower(args[0])
 		platform, err := normalizeFlutterPlatform(platformArg)
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 
 		var ok bool
 		cpPatchAppID, ok = resolveAppID(cpPatchAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 		if cpPatchReleaseVersion == "" {
-			ui.Error("--release-version is required")
-			return
+			fail("--release-version is required")
 		}
 
 		var diffs []api.FlutterArchDiff
@@ -343,8 +333,7 @@ var codepushFlutterPatchCmd = &cobra.Command{
 			//   5. Upload the diffs to AirBuild in one patch
 
 			if _, err := shorebird.BundledFlutter(); err != nil {
-				ui.Error("%v", err)
-				return
+				fail("%v", err)
 			}
 
 			if platform == "ANDROID" {
@@ -360,14 +349,12 @@ var codepushFlutterPatchCmd = &cobra.Command{
 				}
 			}
 			if err != nil {
-				ui.Error("%v", err)
-				return
+				fail("%v", err)
 			}
 		} else {
 			artifact := cpPatchArtifact
 			if _, err := os.Stat(artifact); err != nil {
-				ui.Error("Artifact not found: %s", artifact)
-				return
+				fail("Artifact not found: %s", artifact)
 			}
 			if platform == "IOS" && cpPatchArchitecture == "" {
 				cpPatchArchitecture = "aarch64"
@@ -377,8 +364,7 @@ var codepushFlutterPatchCmd = &cobra.Command{
 
 		for _, d := range diffs {
 			if _, err := os.Stat(d.Path); err != nil {
-				ui.Error("Artifact not found: %s", d.Path)
-				return
+				fail("Artifact not found: %s", d.Path)
 			}
 		}
 
@@ -397,17 +383,22 @@ var codepushFlutterPatchCmd = &cobra.Command{
 			diffs, cpPatchAppID, platform, cpPatchReleaseVersion, cpPatchChannel, cpPatchNotes,
 		)
 		if err != nil {
-			ui.Error("Failed to create patch: %v", err)
-			return
+			fail("Failed to create patch: %v", err)
 		}
 
-		ui.Success("Patch #%d created (DRAFT, 0%% rollout)", resp.Update.PatchNumber)
 		// Auto-generated diffs are temp files — clean up after upload.
 		if cpPatchArtifact == "" {
 			for _, d := range diffs {
 				os.Remove(d.Path) //nolint:errcheck
 			}
 		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
+			return
+		}
+
+		ui.Success("Patch #%d created (DRAFT, 0%% rollout)", resp.Update.PatchNumber)
 		ui.Info("Promote it with: airbuild codepush flutter promote --patch %d --channel %s --rollout 25",
 			resp.Update.PatchNumber, valueOr(cpPatchChannel, "production"))
 	},
@@ -446,20 +437,17 @@ var codepushFlutterPromoteCmd = &cobra.Command{
 		var ok bool
 		cpPromoteAppID, ok = resolveAppID(cpPromoteAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 		if cpPromoteUpdateID == "" && (cpPromoteReleaseVersion == "" || cpPromotePlatform == "" || cpPromotePatchNumber == 0) {
-			ui.Error("Provide --update-id, or --release-version + --platform + --patch")
-			return
+			fail("Provide --update-id, or --release-version + --platform + --patch")
 		}
 		platform, err := normalizePlatformFlag(cpPromotePlatform)
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 		if err := validateRolloutPercent(cpPromoteRollout); err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 
 		cfg := mustLoadConfig()
@@ -475,10 +463,13 @@ var codepushFlutterPromoteCmd = &cobra.Command{
 		}
 		resp, err := client.CodePushFlutterPromote(ref, cpPromoteRollout)
 		if err != nil {
-			ui.Error("Failed to promote patch: %v", err)
-			return
+			fail("Failed to promote patch: %v", err)
 		}
 
+		if jsonOutput {
+			ui.PrintJSON(resp)
+			return
+		}
 		ui.Success("Patch #%d promoted to %s at %d%% rollout", resp.Update.PatchNumber, resp.Update.Channel, resp.Update.RolloutPercent)
 	},
 }
@@ -512,16 +503,14 @@ var codepushFlutterRollbackCmd = &cobra.Command{
 		var ok bool
 		cpRollbackAppID, ok = resolveAppID(cpRollbackAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 		if cpRollbackUpdateID == "" && (cpRollbackReleaseVersion == "" || cpRollbackPlatform == "" || cpRollbackPatchNumber == 0) {
-			ui.Error("Provide --update-id, or --release-version + --platform + --patch")
-			return
+			fail("Provide --update-id, or --release-version + --platform + --patch")
 		}
 		platform, err := normalizePlatformFlag(cpRollbackPlatform)
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 
 		cfg := mustLoadConfig()
@@ -537,10 +526,13 @@ var codepushFlutterRollbackCmd = &cobra.Command{
 		}
 		resp, err := client.CodePushFlutterRollback(ref)
 		if err != nil {
-			ui.Error("Failed to rollback patch: %v", err)
-			return
+			fail("Failed to rollback patch: %v", err)
 		}
 
+		if jsonOutput {
+			ui.PrintJSON(resp)
+			return
+		}
 		ui.Success("Patch #%d rolled back", resp.Update.PatchNumber)
 	},
 }
@@ -566,7 +558,7 @@ var codepushFlutterStatusCmd = &cobra.Command{
 		var ok bool
 		cpStatusAppID, ok = resolveAppID(cpStatusAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 
 		cfg := mustLoadConfig()
@@ -574,7 +566,11 @@ var codepushFlutterStatusCmd = &cobra.Command{
 
 		resp, err := client.CodePushFlutterStatus(cpStatusAppID)
 		if err != nil {
-			ui.Error("Failed to fetch status: %v", err)
+			fail("Failed to fetch status: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
 			return
 		}
 
@@ -643,47 +639,40 @@ var codepushReactNativePublishCmd = &cobra.Command{
 		var ok bool
 		cpRnAppID, ok = resolveAppID(cpRnAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 		if cpRnPlatform == "" || cpRnRuntimeVersion == "" {
-			ui.Error("--platform and --runtime-version are required")
-			return
+			fail("--platform and --runtime-version are required")
 		}
 		platform, err := normalizeFlutterPlatform(cpRnPlatform) // ANDROID/IOS normalization is framework-agnostic
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 		expoPlatform := strings.ToLower(cpRnPlatform)
 
 		if !cpRnSkipExport {
 			if !expo.IsInstalled() {
-				ui.Error("npx not found on PATH. Install Node.js, or pass --skip-export if you already ran `expo export`.")
-				return
+				fail("npx not found on PATH. Install Node.js, or pass --skip-export if you already ran `expo export`.")
 			}
 			ui.Info("Running `npx expo export --output-dir %s --platform %s`...", cpRnOutputDir, expoPlatform)
 			if err := expo.Run(".", "export", "--output-dir", cpRnOutputDir, "--platform", expoPlatform); err != nil {
-				ui.Error("%v", err)
-				return
+				fail("%v", err)
 			}
 		}
 
 		meta, err := expo.ParseMetadata(cpRnOutputDir)
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 		entries, err := expo.BuildManifestEntries(cpRnOutputDir, meta, expoPlatform)
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 
 		apiEntries := make([]api.ReactNativeManifestEntry, 0, len(entries))
 		for _, e := range entries {
 			if _, err := os.Stat(e.FilePath); err != nil {
-				ui.Error("File referenced in metadata.json not found: %s", e.FilePath)
-				return
+				fail("File referenced in metadata.json not found: %s", e.FilePath)
 			}
 			apiEntries = append(apiEntries, api.ReactNativeManifestEntry{
 				FieldName:     e.FieldName,
@@ -701,7 +690,11 @@ var codepushReactNativePublishCmd = &cobra.Command{
 		ui.Info("Uploading %d file(s) (bundle + assets)...", len(apiEntries))
 		resp, err := client.CodePushReactNativePublish(apiEntries, cpRnAppID, platform, cpRnRuntimeVersion, cpRnChannel, cpRnNotes)
 		if err != nil {
-			ui.Error("Failed to publish update: %v", err)
+			fail("Failed to publish update: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
 			return
 		}
 
@@ -745,20 +738,17 @@ var codepushReactNativePromoteCmd = &cobra.Command{
 		var ok bool
 		cpRnPromoteAppID, ok = resolveAppID(cpRnPromoteAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 		if cpRnPromoteUpdateID == "" && (cpRnPromotePlatform == "" || cpRnPromoteRuntimeVersion == "") {
-			ui.Error("Provide --update-id, or --platform + --runtime-version")
-			return
+			fail("Provide --update-id, or --platform + --runtime-version")
 		}
 		platform, err := normalizePlatformFlag(cpRnPromotePlatform)
 		if err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 		if err := validateRolloutPercent(cpRnPromoteRollout); err != nil {
-			ui.Error("%v", err)
-			return
+			fail("%v", err)
 		}
 
 		cfg := mustLoadConfig()
@@ -769,10 +759,13 @@ var codepushReactNativePromoteCmd = &cobra.Command{
 			cpRnPromoteChannel, cpRnPromoteRollout,
 		)
 		if err != nil {
-			ui.Error("Failed to promote update: %v", err)
-			return
+			fail("Failed to promote update: %v", err)
 		}
 
+		if jsonOutput {
+			ui.PrintJSON(resp)
+			return
+		}
 		ui.Success("Update promoted to %s at %d%% rollout", resp.Update.Channel, resp.Update.RolloutPercent)
 	},
 }
@@ -801,11 +794,10 @@ var codepushReactNativeRollbackCmd = &cobra.Command{
 		var ok bool
 		cpRnRollbackAppID, ok = resolveAppID(cpRnRollbackAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 		if cpRnRollbackUpdateID == "" {
-			ui.Error("--update-id is required")
-			return
+			fail("--update-id is required")
 		}
 
 		cfg := mustLoadConfig()
@@ -813,10 +805,13 @@ var codepushReactNativeRollbackCmd = &cobra.Command{
 
 		resp, err := client.CodePushReactNativeRollback(cpRnRollbackAppID, cpRnRollbackUpdateID)
 		if err != nil {
-			ui.Error("Failed to rollback update: %v", err)
-			return
+			fail("Failed to rollback update: %v", err)
 		}
 
+		if jsonOutput {
+			ui.PrintJSON(resp)
+			return
+		}
 		ui.Success("Update %s rolled back", resp.Update.ID)
 	},
 }
@@ -838,7 +833,7 @@ var codepushReactNativeStatusCmd = &cobra.Command{
 		var ok bool
 		cpRnStatusAppID, ok = resolveAppID(cpRnStatusAppID)
 		if !ok {
-			return
+			os.Exit(1)
 		}
 
 		cfg := mustLoadConfig()
@@ -846,7 +841,11 @@ var codepushReactNativeStatusCmd = &cobra.Command{
 
 		resp, err := client.CodePushReactNativeStatus(cpRnStatusAppID)
 		if err != nil {
-			ui.Error("Failed to fetch status: %v", err)
+			fail("Failed to fetch status: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
 			return
 		}
 

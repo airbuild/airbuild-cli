@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +17,6 @@ var pushPlatform string
 var pushRelease bool
 var pushDebug bool
 var pushAll bool
-var pushJSON bool
 var pushReleaseNotes string
 
 var pushCmd = &cobra.Command{
@@ -41,7 +39,7 @@ Examples:
 		if err != nil {
 			ui.Error("%v", err)
 			ui.Info("Run `airbuild init` to set up your project first.")
-			return
+			os.Exit(1)
 		}
 
 		cfg := mustLoadConfig()
@@ -53,8 +51,7 @@ Examples:
 			buildType = "debug"
 		}
 		if pushRelease && pushDebug {
-			ui.Error("Cannot specify both --release and --debug")
-			return
+			fail("Cannot specify both --release and --debug")
 		}
 
 		// Determine which platforms to push
@@ -72,7 +69,7 @@ Examples:
 				} else {
 					ui.Info("No platforms found in config. Check your .airbuild.json — the 'builds' key may be missing or empty.")
 				}
-				return
+				os.Exit(1)
 			}
 			platformsToPush = []string{p}
 		} else {
@@ -82,17 +79,16 @@ Examples:
 			} else if len(configuredPlatforms) == 0 {
 				ui.Error("No platforms configured in .airbuild.json")
 				ui.Info("Run `airbuild init` to configure build paths.")
-				return
+				os.Exit(1)
 			} else {
 				ui.Error("Multiple platforms configured. Specify --platform or --all.")
 				ui.Info("Configured platforms: %s", strings.Join(configuredPlatforms, ", "))
-				return
+				os.Exit(1)
 			}
 		}
 
 		if len(platformsToPush) == 0 {
-			ui.Error("No platforms to push")
-			return
+			fail("No platforms to push")
 		}
 
 		// Upload each platform
@@ -103,8 +99,8 @@ Examples:
 		}
 
 		// Output results
-		if pushJSON {
-			outputJSON(results)
+		if jsonOutput {
+			ui.PrintJSON(results)
 		} else {
 			outputHuman(results, cfg.APIURL)
 		}
@@ -217,21 +213,11 @@ func outputHuman(results []pushResult, baseURL string) {
 	}
 }
 
-func outputJSON(results []pushResult) {
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		ui.Error("Could not marshal JSON output: %v", err)
-		return
-	}
-	fmt.Println(string(data))
-}
-
 func init() {
 	pushCmd.Flags().StringVar(&pushPlatform, "platform", "", "Platform to push: android or ios")
 	pushCmd.Flags().BoolVar(&pushRelease, "release", false, "Push release build (default)")
 	pushCmd.Flags().BoolVar(&pushDebug, "debug", false, "Push debug build")
 	pushCmd.Flags().BoolVar(&pushAll, "all", false, "Push all configured platforms")
-	pushCmd.Flags().BoolVar(&pushJSON, "json", false, "Output results as JSON (for CI/CD)")
 	pushCmd.Flags().StringVar(&pushReleaseNotes, "release-notes", "", "Release notes for this build")
 	rootCmd.AddCommand(pushCmd)
 }

@@ -21,8 +21,7 @@ var linksListCmd = &cobra.Command{
 	Short: "List install links for an app",
 	Run: func(cmd *cobra.Command, args []string) {
 		if linksAppID == "" {
-			ui.Error("--app-id is required. Run `airbuild apps list` to see your apps.")
-			return
+			fail("--app-id is required. Run `airbuild apps list` to see your apps.")
 		}
 
 		cfg := mustLoadConfig()
@@ -30,7 +29,11 @@ var linksListCmd = &cobra.Command{
 
 		resp, err := client.ListLinks(linksAppID)
 		if err != nil {
-			ui.Error("Failed to list links: %v", err)
+			fail("Failed to list links: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
 			return
 		}
 
@@ -68,8 +71,7 @@ var linksCreateCmd = &cobra.Command{
 	Short: "Create a new install link for a build",
 	Run: func(cmd *cobra.Command, args []string) {
 		if linksBuildID == "" {
-			ui.Error("--build-id is required. Run `airbuild builds list --app-id xxx` to see builds.")
-			return
+			fail("--build-id is required. Run `airbuild builds list --app-id xxx` to see builds.")
 		}
 
 		cfg := mustLoadConfig()
@@ -77,7 +79,11 @@ var linksCreateCmd = &cobra.Command{
 
 		resp, err := client.CreateLink(linksBuildID)
 		if err != nil {
-			ui.Error("Failed to create link: %v", err)
+			fail("Failed to create link: %v", err)
+		}
+
+		if jsonOutput {
+			ui.PrintJSON(resp)
 			return
 		}
 

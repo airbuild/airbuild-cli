@@ -14,12 +14,12 @@ const (
 )
 
 var (
-	kernel32                       = syscall.NewLazyDLL("kernel32.dll")
-	procGetConsoleMode             = kernel32.NewProc("GetConsoleMode")
-	procSetConsoleMode             = kernel32.NewProc("SetConsoleMode")
-	procGetStdHandle               = kernel32.NewProc("GetStdHandle")
-	procSetConsoleOutputCP         = kernel32.NewProc("SetConsoleOutputCP")
-	STD_OUTPUT_HANDLE              = ^uintptr(0) // -1
+	kernel32               = syscall.NewLazyDLL("kernel32.dll")
+	procGetConsoleMode     = kernel32.NewProc("GetConsoleMode")
+	procSetConsoleMode     = kernel32.NewProc("SetConsoleMode")
+	procGetStdHandle       = kernel32.NewProc("GetStdHandle")
+	procSetConsoleOutputCP = kernel32.NewProc("SetConsoleOutputCP")
+	STD_OUTPUT_HANDLE      = ^uintptr(0) // -1
 )
 
 // enableVT enables Virtual Terminal processing on the Windows console so
