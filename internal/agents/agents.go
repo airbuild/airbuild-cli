@@ -38,8 +38,8 @@ uploads, install links, and CodePush OTA patches for Flutter / React Native).
   ` + "`airbuild login --api-key $AIRBUILD_API_KEY`" + ` or just export the key.
 - Auth: ` + "`AIRBUILD_API_KEY`" + ` env var (Dashboard → Settings → API Keys).
   NEVER commit it, ` + "`~/.airbuild/config.json`" + `, or any ` + "`airbuild_*`" + ` key.
-- Custom endpoint (staging): set ` + "`AIRBUILD_API_URL`" + `. Project config lives in
-  ` + "`.airbuild.json`" + ` (app ID + build paths, created by ` + "`airbuild init`" + `).
+- Project config lives in ` + "`.airbuild.json`" + ` (app ID + build paths,
+  created by ` + "`airbuild init`" + `).
 
 ### In-app SDKs (update prompts inside the app)
 
