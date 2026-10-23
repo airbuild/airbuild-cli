@@ -7,10 +7,12 @@ import (
 	"testing"
 )
 
+const testServer = "https://airbuild.test"
+
 func TestWriteAllCreatesFiles(t *testing.T) {
 	dir := t.TempDir()
 
-	written, err := WriteAll(dir)
+	written, err := WriteAll(dir, testServer)
 	if err != nil {
 		t.Fatalf("WriteAll failed: %v", err)
 	}
@@ -33,6 +35,12 @@ func TestWriteAllCreatesFiles(t *testing.T) {
 		if !strings.Contains(s, "flutter pub add airbuild") || !strings.Contains(s, "dk_") {
 			t.Errorf("%s missing in-app SDK content", name)
 		}
+		if !strings.Contains(s, testServer+"/i/<slug>") || !strings.Contains(s, testServer+"/api/openapi") {
+			t.Errorf("%s missing configured server URLs", name)
+		}
+		if !strings.Contains(s, "baseUrl: '"+testServer+"'") {
+			t.Errorf("%s missing SDK baseUrl wiring", name)
+		}
 	}
 }
 
@@ -43,7 +51,7 @@ func TestWriteAllPreservesExistingContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := WriteAll(dir); err != nil {
+	if _, err := WriteAll(dir, testServer); err != nil {
 		t.Fatalf("WriteAll failed: %v", err)
 	}
 
@@ -60,10 +68,10 @@ func TestWriteAllPreservesExistingContent(t *testing.T) {
 func TestWriteAllIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 
-	if _, err := WriteAll(dir); err != nil {
+	if _, err := WriteAll(dir, testServer); err != nil {
 		t.Fatalf("first WriteAll failed: %v", err)
 	}
-	if _, err := WriteAll(dir); err != nil {
+	if _, err := WriteAll(dir, testServer); err != nil {
 		t.Fatalf("second WriteAll failed: %v", err)
 	}
 
@@ -82,7 +90,7 @@ func TestWriteAllReplacesBlockInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := WriteAll(dir); err != nil {
+	if _, err := WriteAll(dir, testServer); err != nil {
 		t.Fatalf("WriteAll failed: %v", err)
 	}
 

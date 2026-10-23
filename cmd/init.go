@@ -200,7 +200,7 @@ Examples:
 		// non-interactively, interactive users are asked. --yes alone
 		// does not create files the user didn't request.
 		if initAgents || (!initYes && confirm("Write AI assistant files (AGENTS.md, CLAUDE.md)?", true)) {
-			written, err := agents.WriteAll(".")
+			written, err := agents.WriteAll(".", cfg.APIURL)
 			if err != nil {
 				ui.Warn("Could not write agent files: %v", err)
 			} else {
