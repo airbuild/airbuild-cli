@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -14,6 +16,8 @@ func ReactNativeChecklist() Checklist {
 		{Name: "npx", Run: checkNpx},
 		{Name: "expo-updates", Run: checkExpoUpdates},
 		{Name: "expo-updates config", Run: checkExpoUpdatesConfig},
+		{Name: "expo-updates manifest", Run: checkExpoUpdatesManifest},
+		{Name: "expo cliFile", Run: checkExpoCliFile},
 		{Name: "ios bundleIdentifier", Run: checkIOSBundleIdentifier},
 		{Name: "telemetry module", Run: checkTelemetry},
 		{Name: ".airbuild.json", Run: checkAirbuildJSON},
@@ -39,6 +43,10 @@ func ReactNativeInitActions() Checklist {
 			Modifies: "package.json, lockfile, node_modules"},
 		{Name: "expo-updates config", Run: checkExpoUpdatesConfig, Fix: initExpoUpdatesConfig,
 			Modifies: "app.json"},
+		{Name: "expo-updates manifest", Run: checkExpoUpdatesManifest, Fix: initExpoUpdatesManifest,
+			Modifies: "android/app/src/main/AndroidManifest.xml"},
+		{Name: "expo cliFile", Run: checkExpoCliFile, Fix: fixExpoCliFile,
+			Modifies: "android/app/build.gradle"},
 		{Name: "ios bundleIdentifier", Run: checkIOSBundleIdentifier, Fix: fixIOSBundleIdentifier,
 			Modifies: "app.json"},
 		{Name: "telemetry module", Run: checkTelemetry, Fix: writeTelemetry,
@@ -140,6 +148,123 @@ func checkExpoUpdatesConfig() CheckResult {
 	}
 	return Fail("expo-updates config", "updates.url not configured in app.json",
 		"Run `airbuild codepush react-native init` to configure it")
+}
+
+const (
+	rnAndroidManifestPath = "android/app/src/main/AndroidManifest.xml"
+	rnAppBuildGradlePath  = "android/app/build.gradle"
+)
+
+// checkExpoUpdatesManifest verifies the expo-updates meta-data block exists in
+// AndroidManifest.xml. app.json's expo.updates section only feeds `expo
+// export` — the *runtime* reads EXPO_UPDATE_URL from the manifest meta-data,
+// so bare-RN projects are silently non-updating without it.
+func checkExpoUpdatesManifest() CheckResult {
+	if !FileExists(rnAndroidManifestPath) {
+		return Pass("expo-updates manifest", "no AndroidManifest.xml (Expo-managed or iOS-only)")
+	}
+	if !FileContains(rnAndroidManifestPath, "expo.modules.updates.EXPO_UPDATE_URL") ||
+		!FileContains(rnAndroidManifestPath, "expo.modules.updates.ENABLED") {
+		return Warn("expo-updates manifest",
+			"expo.modules.updates meta-data missing — bare-RN apps need it or the runtime never checks for updates",
+			"Run `airbuild codepush react-native init` to write it")
+	}
+	if FileContains(rnAndroidManifestPath, rnManifestBase()) {
+		return Pass("expo-updates manifest", "AndroidManifest.xml points to AirBuild")
+	}
+	return Warn("expo-updates manifest",
+		"meta-data present but EXPO_UPDATE_URL does not point to this AirBuild server",
+		"Run `airbuild codepush react-native init` to rewrite it")
+}
+
+var rnVersionNameRe = regexp.MustCompile(`versionName\s+["']([^"']+)["']`)
+var rnUpdatesMetaRe = regexp.MustCompile(`(?m)^[^\n]*android:name="expo\.modules\.updates\.[^\n]*\n?`)
+
+func rnVersionName() string {
+	data, err := os.ReadFile(rnAppBuildGradlePath)
+	if err == nil {
+		if m := rnVersionNameRe.FindSubmatch(data); m != nil {
+			return string(m[1])
+		}
+	}
+	return "1.0.0"
+}
+
+// initExpoUpdatesManifest writes (or refreshes) the expo.modules.updates
+// meta-data block inside <application> — URL with the distribution key,
+// runtime version from build.gradle's versionName, ON_LOAD checking, and the
+// production channel header.
+func initExpoUpdatesManifest() error {
+	if !FileExists(rnAndroidManifestPath) {
+		return nil // Expo-managed or iOS-only — nothing to do.
+	}
+	dk, err := distributionKey()
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(rnAndroidManifestPath)
+	if err != nil {
+		return fmt.Errorf("could not read %s: %w", rnAndroidManifestPath, err)
+	}
+	s := rnUpdatesMetaRe.ReplaceAllString(string(data), "")
+	q := func(v string) string { return strings.ReplaceAll(v, "\"", "&quot;") }
+	block := fmt.Sprintf("      <meta-data android:name=\"expo.modules.updates.ENABLED\" android:value=\"true\" />\n"+
+		"      <meta-data android:name=\"expo.modules.updates.EXPO_UPDATE_URL\" android:value=\"%s\" />\n"+
+		"      <meta-data android:name=\"expo.modules.updates.EXPO_RUNTIME_VERSION\" android:value=\"%s\" />\n"+
+		"      <meta-data android:name=\"expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH\" android:value=\"ALWAYS\" />\n"+
+		"      <meta-data android:name=\"expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS\" android:value=\"0\" />\n"+
+		"      <meta-data android:name=\"expo.modules.updates.EXPO_REQUEST_HEADERS\" android:value=\"{%s}\" />\n",
+		q(rnManifestBase()+"?key="+dk), q(rnVersionName()), q(`"expo-channel-name":"production"`))
+	idx := strings.Index(s, "<activity")
+	if idx < 0 {
+		idx = strings.Index(s, "</application>")
+	}
+	if idx < 0 {
+		return fmt.Errorf("could not locate <application> body in %s", rnAndroidManifestPath)
+	}
+	return os.WriteFile(rnAndroidManifestPath, []byte(s[:idx]+block+s[idx:]), 0644)
+}
+
+var expoCliResolveRe = regexp.MustCompile(`require\.resolve\(['"]@expo/cli['"]\)`)
+var expoCliFileLineRe = regexp.MustCompile(`(?m)^\s*cliFile\s*=\s*new File\(\[.*require\.resolve\(['"]@expo/cli['"]\).*$`)
+
+// checkExpoCliFile detects the install-expo-modules generated line
+//   cliFile = new File(["node","--print","require.resolve('@expo/cli')"].execute(null, rootDir).text.trim())
+// which fails silently on Node versions whose exports map hides @expo/cli —
+// producing `new File("")`, i.e. the project directory, so Gradle fails with
+// "cliFile is not a file" plus a cascade of implicit-dependency errors.
+func checkExpoCliFile() CheckResult {
+	if !FileExists(rnAppBuildGradlePath) {
+		return Pass("expo cliFile", "no android project — skipping")
+	}
+	data, err := os.ReadFile(rnAppBuildGradlePath)
+	if err != nil || !expoCliResolveRe.Match(data) {
+		return Pass("expo cliFile", "cliFile does not use require.resolve('@expo/cli')")
+	}
+	out, err := exec.Command("node", "--print", "require.resolve('@expo/cli')").Output()
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return Pass("expo cliFile", "require.resolve('@expo/cli') resolves on this Node")
+	}
+	return Warn("expo cliFile",
+		"generated cliFile uses require.resolve('@expo/cli') which fails on this Node — Gradle would set cliFile to a directory",
+		"Run `airbuild codepush react-native init` to point cliFile at node_modules/expo/bin/cli")
+}
+
+// fixExpoCliFile replaces the fragile generated resolution with the concrete
+// CLI entry — node_modules/expo/bin/cli is what `npx expo` links to and it
+// supports the `export:embed` bundle command.
+func fixExpoCliFile() error {
+	data, err := os.ReadFile(rnAppBuildGradlePath)
+	if err != nil {
+		return fmt.Errorf("could not read %s: %w", rnAppBuildGradlePath, err)
+	}
+	if !expoCliFileLineRe.Match(data) {
+		return ErrManualAction
+	}
+	s := expoCliFileLineRe.ReplaceAllStringFunc(string(data), func(string) string {
+		return `    cliFile = file("${rootDir}/../node_modules/expo/bin/cli")`
+	})
+	return os.WriteFile(rnAppBuildGradlePath, []byte(s), 0644)
 }
 
 func checkIOSBundleIdentifier() CheckResult {
