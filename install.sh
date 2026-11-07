@@ -5,10 +5,16 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/airbuild/airbuild-cli/main/install.sh | bash
 #
+# Pin a version, or choose the install directory:
+#   curl -fsSL .../install.sh | AIRBUILD_VERSION=v1.2.0 bash
+#   curl -fsSL .../install.sh | AIRBUILD_INSTALL_DIR=$HOME/bin bash
+#
+# The binary is verified against the release's checksums.txt (SHA-256) before
+# it is installed; a missing or mismatching checksum aborts the install.
+#
 set -euo pipefail
 
 REPO="airbuild/airbuild-cli"
-GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
 
 # Colors
 if [ -t 1 ]; then
@@ -59,28 +65,56 @@ fi
 
 info "Install directory: ${INSTALL_DIR}"
 
-# --- Find the latest release download URL ---
-# Try the direct GitHub redirect first (works without API rate limits)
-DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY}"
+# --- Resolve the release (latest, or AIRBUILD_VERSION=vX.Y.Z) ---
+if [ -n "${AIRBUILD_VERSION:-}" ]; then
+  TAG="${AIRBUILD_VERSION#cli-}"
+  case "$TAG" in v*) ;; *) TAG="v${TAG}" ;; esac
+  BASE_URL="https://github.com/${REPO}/releases/download/cli-${TAG}"
+  info "Installing pinned version ${TAG}"
+else
+  # The direct redirect works without GitHub API rate limits.
+  BASE_URL="https://github.com/${REPO}/releases/latest/download"
+fi
 
-# --- Download ---
+# --- Pick a SHA-256 tool (sha256sum on Linux, shasum on macOS) ---
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  err "Neither sha256sum nor shasum found — cannot verify the download."
+  exit 1
+fi
+
+# --- Download binary + checksums ---
 TMPFILE="$(mktemp -t airbuild.XXXXXX)"
-trap 'rm -f "$TMPFILE"' EXIT
+SUMFILE="$(mktemp -t airbuild-sums.XXXXXX)"
+trap 'rm -f "$TMPFILE" "$SUMFILE"' EXIT
 
 info "Downloading ${BINARY}..."
-if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMPFILE"; then
-  err "Download failed. Please check your internet connection."
+if ! curl -fsSL --connect-timeout 15 --max-time 600 "${BASE_URL}/${BINARY}" -o "$TMPFILE"; then
+  err "Download failed. Please check your internet connection (or the version)."
   err "If no release exists yet, build from source:"
   err "  go install github.com/airbuild/airbuild-cli@latest"
   exit 1
 fi
-
-# --- Verify it's a binary (not an HTML error page) ---
-if file "$TMPFILE" | grep -q "HTML\|ASCII text"; then
-  err "Downloaded file is not a binary — the release may not exist yet."
-  err "Build from source instead: go install github.com/airbuild/airbuild-cli@latest"
+if ! curl -fsSL --connect-timeout 15 --max-time 60 "${BASE_URL}/checksums.txt" -o "$SUMFILE"; then
+  err "Could not download checksums.txt — refusing to install an unverified binary."
   exit 1
 fi
+
+# --- Verify integrity ---
+EXPECTED="$(awk -v f="$BINARY" '{n=$2; sub(/^\*/,"",n)} n==f {print $1}' "$SUMFILE" | head -n1)"
+ACTUAL="$(sha256 "$TMPFILE")"
+if [ -z "$EXPECTED" ]; then
+  err "No checksum listed for ${BINARY} — refusing to install."
+  exit 1
+fi
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  err "Checksum mismatch for ${BINARY} (expected ${EXPECTED}, got ${ACTUAL}) — refusing to install."
+  exit 1
+fi
+ok "Checksum verified (sha256 ${ACTUAL})"
 
 chmod +x "$TMPFILE"
 

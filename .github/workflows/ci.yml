@@ -17,11 +17,24 @@ jobs:
         with:
           go-version: "1.23"
 
+      - name: Format check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test ./...
+      - name: Test (race detector)
+        run: go test -race -cover ./...
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Verify install scripts parse
+        run: bash -n install.sh
 
       - name: Build (current platform)
         run: go build -ldflags "-X main.version=dev" -trimpath .
