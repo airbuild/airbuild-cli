@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -38,7 +39,6 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	cfg := &Config{
 		APIKey:  "airbuild_test_key",
 		APIURL:  "https://staging.airbuild.dev",
-		AppID:   "app_xxx",
 		OrgID:   "org_xxx",
 		OrgName: "Test Org",
 	}
@@ -133,5 +133,32 @@ func TestLoadInvalidJSON(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected an error for invalid JSON config, got nil")
+	}
+}
+
+func TestLegacyAppIDIsIgnoredAndDroppedOnSave(t *testing.T) {
+	home := withTempHome(t)
+	dir := filepath.Join(home, ".airbuild")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"apiKey":"airbuild_k","apiUrl":"https://x.test","appId":"app_old"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "config.json"))
+	if strings.Contains(string(data), "appId") {
+		t.Errorf("appId should be dropped on save, got %s", data)
+	}
+	fi, _ := os.Stat(filepath.Join(dir, "config.json"))
+	if fi.Mode().Perm() != 0600 {
+		t.Errorf("config perms = %v, want 0600", fi.Mode().Perm())
 	}
 }

@@ -3,7 +3,6 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/airbuild/airbuild-cli/internal/setup"
 	"github.com/airbuild/airbuild-cli/internal/ui"
@@ -39,8 +38,8 @@ Checks:
   - AirBuild API reachable
 
 Exits with status 1 if any check fails.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runDoctor(flutterFramework, setup.FlutterChecklist())
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runDoctor(flutterFramework, setup.FlutterChecklist())
 	},
 }
 
@@ -58,8 +57,8 @@ Checks:
   - AirBuild API reachable
 
 Exits with status 1 if any check fails.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runDoctor(reactNativeFramework, setup.ReactNativeChecklist())
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runDoctor(reactNativeFramework, setup.ReactNativeChecklist())
 	},
 }
 
@@ -74,8 +73,8 @@ Currently installs:
   - Shorebird CLI (clones github.com/shorebirdtech/shorebird to ~/.shorebird)
 
 Requires Dart to be installed first. Asks for confirmation unless --yes is set.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runFixes(cmd, flutterFramework, "install", setup.FlutterInstallActions(), setup.FlutterChecklist())
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runFixes(cmd, flutterFramework, "install", setup.FlutterInstallActions(), setup.FlutterChecklist())
 	},
 }
 
@@ -88,8 +87,8 @@ Currently installs:
   - expo-updates (via 'npx expo install' for Expo apps, 'npm install' for bare React Native)
 
 Requires Node.js to be installed first. Asks for confirmation unless --yes is set.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runFixes(cmd, reactNativeFramework, "install", setup.ReactNativeInstallActions(), setup.ReactNativeChecklist())
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runFixes(cmd, reactNativeFramework, "install", setup.ReactNativeInstallActions(), setup.ReactNativeChecklist())
 	},
 }
 
@@ -105,8 +104,8 @@ sets base_url and your app's distribution_key, and adds app_id if missing.
 Run 'airbuild init' and 'airbuild login' first.
 
 Asks for confirmation unless --yes is set.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runFixes(cmd, flutterFramework, "init", setup.FlutterInitActions(), setup.FlutterChecklist())
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runFixes(cmd, flutterFramework, "init", setup.FlutterInitActions(), setup.FlutterChecklist())
 	},
 }
 
@@ -120,8 +119,8 @@ your app's AirBuild manifest URL. For app.config.js/ts, prints the snippet
 to add. Run 'airbuild init' and 'airbuild login' first.
 
 Asks for confirmation unless --yes is set.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		runFixes(cmd, reactNativeFramework, "init", setup.ReactNativeInitActions(), setup.ReactNativeChecklist())
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runFixes(cmd, reactNativeFramework, "init", setup.ReactNativeInitActions(), setup.ReactNativeChecklist())
 	},
 }
 
@@ -156,7 +155,7 @@ func printResults(results []setup.CheckResult) {
 	}
 }
 
-func runDoctor(fw setupFramework, checks setup.Checklist) {
+func runDoctor(fw setupFramework, checks setup.Checklist) error {
 	ui.Header("%s CodePush — Environment Check", fw.Name)
 	ui.Println("")
 
@@ -168,19 +167,20 @@ func runDoctor(fw setupFramework, checks setup.Checklist) {
 	ui.Println("")
 	if failures == 0 && warnings == 0 {
 		ui.Success("All checks passed — %s CodePush is ready to use", fw.Name)
-		return
+		return nil
 	}
 	ui.Info("%d issue(s) found, %d warning(s)", failures, warnings)
 	ui.Muted("Run 'airbuild codepush %s install' and 'airbuild codepush %s init' to fix what can be fixed automatically", fw.Command, fw.Command)
 	if failures > 0 {
-		os.Exit(1)
+		return errSilent
 	}
+	return nil
 }
 
 // runFixes powers both `install` and `init`: it evaluates the full checklist,
 // selects the fixable actions whose check isn't passing, confirms with the
 // user, applies them, then re-checks. Exits 1 if anything remains broken.
-func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullChecklist setup.Checklist) {
+func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullChecklist setup.Checklist) error {
 	yes, _ := cmd.Flags().GetBool("yes")
 	if yes {
 		assumeYes = true
@@ -206,8 +206,7 @@ func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullC
 	ui.Println("")
 	if len(toFix) == 0 {
 		ui.Success("Nothing to %s — everything this command manages is already set up", verb)
-		exitIfFailures(fw, actions, fullChecklist.Evaluate())
-		return
+		return exitIfFailures(fw, actions, fullChecklist.Evaluate())
 	}
 
 	ui.Println("The following changes will be made:")
@@ -217,7 +216,7 @@ func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullC
 	ui.Println("")
 	if !yes && !confirm("Proceed?", true) {
 		ui.Muted("Aborted — no changes made")
-		os.Exit(1)
+		return errSilent
 	}
 
 	for _, c := range toFix {
@@ -234,16 +233,16 @@ func runFixes(cmd *cobra.Command, fw setupFramework, verb string, actions, fullC
 	}
 
 	ui.Println("")
-	exitIfFailures(fw, actions, fullChecklist.Evaluate())
+	return exitIfFailures(fw, actions, fullChecklist.Evaluate())
 }
 
 // exitIfFailures reports overall readiness, and exits 1 if any check this
 // command is responsible for (actions) is still not passing.
-func exitIfFailures(fw setupFramework, actions setup.Checklist, results []setup.CheckResult) {
+func exitIfFailures(fw setupFramework, actions setup.Checklist, results []setup.CheckResult) error {
 	remaining := setup.CountFailures(results) + setup.CountWarnings(results)
 	if remaining == 0 {
 		ui.Success("%s CodePush is ready", fw.Name)
-		return
+		return nil
 	}
 	ui.Warn("%d issue(s) remain — run 'airbuild codepush %s doctor' for details", remaining, fw.Command)
 	if fw.Command == "flutter" {
@@ -258,7 +257,8 @@ func exitIfFailures(fw setupFramework, actions setup.Checklist, results []setup.
 	}
 	for _, r := range results {
 		if owned[r.Name] && r.Status != setup.StatusPass {
-			os.Exit(1)
+			return errSilent
 		}
 	}
+	return nil
 }

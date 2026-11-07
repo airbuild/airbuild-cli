@@ -17,10 +17,10 @@ var configCmd = &cobra.Command{
 var configShowCmd = &cobra.Command{
 	Use:   "show",
 	Short: "Show current configuration",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load()
 		if err != nil {
-			fail("Could not load config: %v", err)
+			return failf("Could not load config: %v", err)
 		}
 
 		ui.Header("Configuration")
@@ -39,9 +39,8 @@ var configShowCmd = &cobra.Command{
 				"apiKey":  apiKeyDisplay,
 				"orgId":   cfg.OrgID,
 				"orgName": cfg.OrgName,
-				"appId":   cfg.AppID,
 			})
-			return
+			return nil
 		}
 		ui.Table(
 			[]string{"Key", "Value"},
@@ -50,9 +49,9 @@ var configShowCmd = &cobra.Command{
 				{"API Key", apiKeyDisplay},
 				{"Org ID", cfg.OrgID},
 				{"Org Name", cfg.OrgName},
-				{"Default App ID", cfg.AppID},
 			},
 		)
+		return nil
 	},
 }
 
@@ -64,13 +63,13 @@ var configSetCmd = &cobra.Command{
 Examples:
   airbuild config set --api-key airbuild_xxx
   airbuild config set --api-url https://staging.airbuild.dev`,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		// LoadFile, not Load — env overrides must never be persisted to
 		// the config file (AIRBUILD_API_KEY would otherwise be written
 		// to disk when the user only intended to change the URL).
 		cfg, err := config.LoadFile()
 		if err != nil {
-			fail("Could not load config: %v", err)
+			return failf("Could not load config: %v", err)
 		}
 
 		changed := false
@@ -79,19 +78,21 @@ Examples:
 			changed = true
 		}
 		if configSetAPIURL != "" {
+			warnInsecureURL(configSetAPIURL)
 			cfg.APIURL = configSetAPIURL
 			changed = true
 		}
 
 		if !changed {
-			fail("No values to set. Use --api-key or --api-url.")
+			return failf("No values to set. Use --api-key or --api-url.")
 		}
 
 		if err := cfg.Save(); err != nil {
-			fail("Could not save config: %v", err)
+			return failf("Could not save config: %v", err)
 		}
 
 		ui.Success("Configuration updated")
+		return nil
 	},
 }
 

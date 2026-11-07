@@ -18,6 +18,7 @@ import (
 var initAppID string
 var initYes bool
 var initAgents bool
+var initForce bool
 
 // assumeYes makes every prompt()/confirm() return its default without
 // reading stdin — set by --yes on interactive commands (init, upgrade).
@@ -39,21 +40,31 @@ Android native, iOS native).
 Examples:
   airbuild init                    # Interactive setup
   airbuild init --app-id clxxxx    # Link an existing app
-  airbuild init --yes --agents     # Non-interactive, defaults + AI assistant files`,
-	Run: func(cmd *cobra.Command, args []string) {
+  airbuild init --yes --agents     # Non-interactive, defaults + AI assistant files
+  airbuild init --yes --force      # Non-interactive and replace an existing config`,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		assumeYes = initYes
 
-		cfg := mustLoadConfig()
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		// Check if config already exists
 		if project.Exists() {
 			ui.Warn(".airbuild.json already exists in this directory.")
-			// --yes defaults this to "no" — init never clobbers an
-			// existing config non-interactively.
-			if !confirm("Overwrite it?", false) {
+			switch {
+			case initForce:
+				ui.Info("Overwriting (--force).")
+			case initYes:
+				// Never clobber an existing config non-interactively without
+				// --force, and never report success for a no-op: scripts and
+				// agents must see a failure.
+				return failf("%s already exists — nothing was changed. Re-run with --force to overwrite it, or edit it directly.", project.ConfigFile)
+			case !confirm("Overwrite it?", false):
 				ui.Info("Aborted.")
-				return
+				return errSilent
 			}
 		}
 
@@ -66,7 +77,7 @@ Examples:
 			ui.Info("Looking up app %s...", appID)
 			apps, err := client.ListApps()
 			if err != nil {
-				fail("Failed to list apps: %v", err)
+				return failf("Failed to list apps: %v", err)
 			}
 			found := false
 			for _, a := range apps.Apps {
@@ -77,7 +88,7 @@ Examples:
 				}
 			}
 			if !found {
-				fail("App not found: %s (make sure it belongs to your organization)", appID)
+				return failf("App not found: %s (make sure it belongs to your organization)", appID)
 			}
 			ui.Success("Found app: %s", app.Name)
 		} else {
@@ -92,10 +103,10 @@ Examples:
 				ui.Info("Fetching your apps...")
 				apps, err := client.ListApps()
 				if err != nil {
-					fail("Failed to list apps: %v", err)
+					return failf("Failed to list apps: %v", err)
 				}
 				if len(apps.Apps) == 0 {
-					fail("No apps found in your organization. Create one first or choose option 2.")
+					return failf("No apps found in your organization. Create one first or choose option 2.")
 				}
 				ui.Println("")
 				for i, a := range apps.Apps {
@@ -105,7 +116,7 @@ Examples:
 				ui.Println("")
 				idx := promptInt("Select app number", 1)
 				if idx < 1 || idx > len(apps.Apps) {
-					fail("Invalid selection")
+					return failf("Invalid selection")
 				}
 				app = apps.Apps[idx-1]
 				appID = app.ID
@@ -114,7 +125,7 @@ Examples:
 				// Create new app
 				name := prompt("App name", defaultAppName())
 				if name == "" {
-					fail("App name is required")
+					return failf("App name is required")
 				}
 
 				ui.Info("Which platforms does this app support?")
@@ -136,13 +147,13 @@ Examples:
 				ui.Info("Creating app '%s'...", name)
 				resp, err := client.CreateApp(name, platforms)
 				if err != nil {
-					fail("Failed to create app: %v", err)
+					return failf("Failed to create app: %v", err)
 				}
 				app = resp.App
 				appID = app.ID
 				ui.Success("Created app: %s (%s)", app.Name, appID)
 			} else {
-				fail("Invalid choice")
+				return failf("Invalid choice")
 			}
 		}
 
@@ -190,7 +201,7 @@ Examples:
 
 		// Save config
 		if err := projCfg.Save(); err != nil {
-			fail("Failed to save config: %v", err)
+			return failf("Failed to save config: %v", err)
 		}
 
 		ui.Info("")
@@ -199,8 +210,8 @@ Examples:
 		// AI assistant files are opt-in: --agents writes them
 		// non-interactively, interactive users are asked. --yes alone
 		// does not create files the user didn't request.
-		if initAgents || (!initYes && confirm("Write AI assistant files (AGENTS.md, CLAUDE.md)?", true)) {
-			written, err := agents.WriteAll(".", cfg.APIURL)
+		if initAgents || (!initYes && confirm("Write AI assistant files (AGENTS.md, CLAUDE.md + airbuild skills)?", true)) {
+			written, err := agents.WriteAll(".", cfg.APIURL, cliVersion)
 			if err != nil {
 				ui.Warn("Could not write agent files: %v", err)
 			} else {
@@ -213,13 +224,15 @@ Examples:
 		ui.Muted("  airbuild push")
 		ui.Muted("  airbuild push --platform android --release")
 		ui.Muted("  airbuild push --all")
+		return nil
 	},
 }
 
 func init() {
 	initCmd.Flags().StringVar(&initAppID, "app-id", "", "Link an existing app by ID")
+	initCmd.Flags().BoolVar(&initForce, "force", false, "Overwrite an existing .airbuild.json")
 	initCmd.Flags().BoolVar(&initYes, "yes", false, "Non-interactive: answer yes to prompts and accept all defaults")
-	initCmd.Flags().BoolVar(&initAgents, "agents", false, "Write AI assistant files (AGENTS.md, CLAUDE.md) without asking")
+	initCmd.Flags().BoolVar(&initAgents, "agents", false, "Write AI assistant files (AGENTS.md, CLAUDE.md, skills) without asking")
 	rootCmd.AddCommand(initCmd)
 }
 

@@ -2,8 +2,8 @@
 
 package ui
 
-// enableColor returns true if ANSI color codes should be emitted.
-// On Unix systems, we colorize when stdout is a TTY.
+// enableColor reports whether this platform can render ANSI colors. Whether a
+// given stream actually gets colors is decided per stream in useColor.
 func enableColor() bool {
-	return isTTY()
+	return true
 }

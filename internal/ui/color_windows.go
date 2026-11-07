@@ -51,13 +51,13 @@ func enableColor() bool {
 
 	// Try to enable VT processing
 	if enableVT() {
-		return isTTY()
+		return true
 	}
 
 	// VT not available — check if we're in a modern terminal (Windows Terminal,
 	// etc.) that supports ANSI natively via TERM env var or WT_SESSION
 	if os.Getenv("WT_SESSION") != "" || os.Getenv("TERM") != "" {
-		return isTTY()
+		return true
 	}
 
 	return false

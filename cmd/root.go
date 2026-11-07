@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"runtime"
+
+	"github.com/airbuild/airbuild-cli/internal/api"
 
 	"github.com/airbuild/airbuild-cli/internal/config"
 	"github.com/airbuild/airbuild-cli/internal/ui"
@@ -16,7 +20,11 @@ var cliVersion = "dev"
 func SetVersion(v string) {
 	cliVersion = v
 	rootCmd.Version = v
+	api.UserAgent = fmt.Sprintf("airbuild-cli/%s (%s/%s)", v, runtime.GOOS, runtime.GOARCH)
 }
+
+// userAgent is the User-Agent the CLI sends on every outbound request.
+func userAgent() string { return api.UserAgent }
 
 // rootCmd is the entry point for the AirBuild CLI.
 // jsonOutput is bound to the global --json flag. When set, human output is
@@ -40,8 +48,9 @@ Or upload a file directly:
 
 Scripting / AI agents: pass --json to any command for machine-readable
 stdout (progress and errors go to stderr).`,
-	SilenceUsage: true,
-	Version:      cliVersion,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	Version:       cliVersion,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		if jsonOutput {
 			ui.SetJSONMode(true)
@@ -54,31 +63,43 @@ func init() {
 		"Output machine-readable JSON on stdout (logs/errors go to stderr)")
 }
 
-// Execute runs the root command.
+// exitError makes the process exit with a specific code without printing
+// anything further (the command already reported the problem).
+type exitError struct{ code int }
+
+func (e exitError) Error() string { return fmt.Sprintf("exit status %d", e.code) }
+
+// errSilent is returned by commands that already printed their error.
+var errSilent error = exitError{code: 1}
+
+// Execute runs the root command and exits once, here, so deferred cleanup in
+// commands always runs and commands stay testable.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
+		var ee exitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.code)
+		}
+		ui.Error("%v", err)
 		os.Exit(1)
 	}
 }
 
-// mustLoadConfig loads the config and exits with an error if not logged in.
-func mustLoadConfig() *config.Config {
+// loadConfig loads the config and returns an error if not logged in.
+func loadConfig() (*config.Config, error) {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
+		return nil, failf("Error loading config: %v", err)
 	}
 	if !cfg.IsLoggedIn() {
-		fmt.Fprintln(os.Stderr, "Not logged in. Run `airbuild login --api-key airbuild_xxx` first, or set AIRBUILD_API_KEY.")
-		os.Exit(1)
+		return nil, failf("Not logged in. Run `airbuild login --api-key airbuild_xxx` first, or set AIRBUILD_API_KEY.")
 	}
-	return cfg
+	return cfg, nil
 }
 
-// fail prints an error to stderr and exits non-zero. Commands use this
-// instead of `ui.Error(...) + return` so scripts and agents can detect
-// failure from the exit code.
-func fail(format string, args ...interface{}) {
+// failf prints an error to stderr and returns errSilent. Commands return it
+// (`return failf(...)`) so scripts and agents see a non-zero exit code.
+func failf(format string, args ...interface{}) error {
 	ui.Error(format, args...)
-	os.Exit(1)
+	return errSilent
 }

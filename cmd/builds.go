@@ -16,27 +16,30 @@ var buildsCmd = &cobra.Command{
 var buildsListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List builds for an app",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		if buildsAppID == "" {
-			fail("--app-id is required. Run `airbuild apps list` to see your apps.")
+			return failf("--app-id is required. Run `airbuild apps list` to see your apps.")
 		}
 
-		cfg := mustLoadConfig()
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		resp, err := client.ListBuilds(buildsAppID)
 		if err != nil {
-			fail("Failed to list builds: %v", err)
+			return failf("Failed to list builds: %v", err)
 		}
 
 		if jsonOutput {
 			ui.PrintJSON(resp)
-			return
+			return nil
 		}
 
 		if len(resp.Builds) == 0 {
 			ui.Info("No builds found for this app.")
-			return
+			return nil
 		}
 
 		ui.Header("Builds (%d)", len(resp.Builds))
@@ -76,6 +79,7 @@ var buildsListCmd = &cobra.Command{
 			})
 		}
 		ui.Table([]string{"ID", "Version", "Platform", "Status", "File", "Install Links"}, rows)
+		return nil
 	},
 }
 

@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +32,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/airbuild/airbuild-cli/internal/download"
 )
 
 // InstallDir returns the directory the official Shorebird installer uses:
@@ -275,21 +276,17 @@ func EnsurePatchBinary() (string, error) {
 
 // downloadAndUnzip fetches url and extracts the zip into outDir.
 func downloadAndUnzip(url, outDir string) error {
-	resp, err := http.Get(url) //nolint:gosec // fixed shorebird.dev host
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close() //nolint:errcheck
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: %s", url, resp.Status)
-	}
 	tmp, err := os.CreateTemp("", "airbuild-artifact-*.zip")
 	if err != nil {
 		return err
 	}
+	tmp.Close()                 //nolint:errcheck
 	defer os.Remove(tmp.Name()) //nolint:errcheck
-	defer tmp.Close()           //nolint:errcheck
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	res, err := download.ToFile(url, tmp.Name(), false)
+	if err != nil {
+		return err
+	}
+	if err := res.VerifyGoogleHash(); err != nil {
 		return err
 	}
 	zr, err := zip.OpenReader(tmp.Name())

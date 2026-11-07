@@ -229,7 +229,9 @@ var expoCliResolveRe = regexp.MustCompile(`require\.resolve\(['"]@expo/cli['"]\)
 var expoCliFileLineRe = regexp.MustCompile(`(?m)^\s*cliFile\s*=\s*new File\(\[.*require\.resolve\(['"]@expo/cli['"]\).*$`)
 
 // checkExpoCliFile detects the install-expo-modules generated line
-//   cliFile = new File(["node","--print","require.resolve('@expo/cli')"].execute(null, rootDir).text.trim())
+//
+//	cliFile = new File(["node","--print","require.resolve('@expo/cli')"].execute(null, rootDir).text.trim())
+//
 // which fails silently on Node versions whose exports map hides @expo/cli —
 // producing `new File("")`, i.e. the project directory, so Gradle fails with
 // "cliFile is not a file" plus a cascade of implicit-dependency errors.

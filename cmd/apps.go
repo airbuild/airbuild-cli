@@ -14,23 +14,26 @@ var appsCmd = &cobra.Command{
 var appsListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all apps in your organization",
-	Run: func(cmd *cobra.Command, args []string) {
-		cfg := mustLoadConfig()
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		resp, err := client.ListApps()
 		if err != nil {
-			fail("Failed to list apps: %v", err)
+			return failf("Failed to list apps: %v", err)
 		}
 
 		if jsonOutput {
 			ui.PrintJSON(resp)
-			return
+			return nil
 		}
 
 		if len(resp.Apps) == 0 {
 			ui.Info("No apps found in your organization.")
-			return
+			return nil
 		}
 
 		ui.Header("Apps (%d)", len(resp.Apps))
@@ -60,6 +63,7 @@ var appsListCmd = &cobra.Command{
 			})
 		}
 		ui.Table([]string{"ID", "Name", "Platforms", "Bundle ID", "Builds"}, rows)
+		return nil
 	},
 }
 

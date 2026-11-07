@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 // Colors (simple ANSI — no external deps).
@@ -39,13 +40,6 @@ func isTTYFile(f *os.File) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// isTTY returns true when either stdout or stderr is a terminal. Human
-// output goes to stderr in JSON mode, so color stays enabled when stdout
-// is piped but stderr is still a terminal.
-func isTTY() bool {
-	return isTTYFile(os.Stdout) || isTTYFile(os.Stderr)
-}
-
 // jsonMode is set when the user passes --json. Human-oriented output
 // (Info/Success/Warn/Header/Table/Muted) is then routed to stderr so
 // stdout carries only machine-readable JSON — safe for scripts and AI
@@ -73,7 +67,7 @@ func out() *os.File {
 func PrintJSON(v interface{}) {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s Could not marshal JSON output: %v\n", colorize(red, symError+" "), err)
+		fmt.Fprintf(os.Stderr, "%s Could not marshal JSON output: %v\n", colorizeFor(os.Stderr, red, symError+" "), err)
 		os.Exit(1)
 	}
 	fmt.Fprintln(os.Stdout, string(data))
@@ -92,16 +86,30 @@ func Println(a ...interface{}) {
 	fmt.Fprintln(out(), a...)
 }
 
-// useColor returns true if we should emit ANSI color codes. On Windows we
-// only colorize when stdout is a terminal AND we've successfully enabled VT
-// processing (or are running in a modern terminal that supports it natively).
+// colorEnabled is the platform capability (Windows must enable VT processing).
 var colorEnabled = enableColor()
 
-func colorize(c, s string) string {
-	if !colorEnabled {
+// useColor decides whether to emit ANSI codes on f: the platform must support
+// them, f must be a terminal, and the user must not have opted out via the
+// NO_COLOR convention (https://no-color.org) or TERM=dumb. Deciding per stream
+// keeps escape codes out of piped output.
+func useColor(f *os.File) bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	return colorEnabled && isTTYFile(f)
+}
+
+func colorizeFor(f *os.File, c, s string) string {
+	if !useColor(f) {
 		return s
 	}
 	return c + s + reset
+}
+
+// colorize colors text destined for the human-output stream.
+func colorize(c, s string) string {
+	return colorizeFor(out(), c, s)
 }
 
 // Success prints a green success message.
@@ -111,7 +119,7 @@ func Success(format string, args ...interface{}) {
 
 // Error prints a red error message.
 func Error(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, colorize(red, symError+" ")+fmt.Sprintf(format, args...)+"\n")
+	fmt.Fprintln(os.Stderr, colorizeFor(os.Stderr, red, symError+" ")+fmt.Sprintf(format, args...))
 }
 
 // Info prints a blue info message.
@@ -151,4 +159,45 @@ func Table(headers []string, rows [][]string) {
 // Muted prints gray text (for secondary info).
 func Muted(format string, args ...interface{}) {
 	fmt.Fprintln(out(), colorize(gray, fmt.Sprintf(format, args...)))
+}
+
+// Progress returns a callback that renders a one-line transfer bar on stderr
+// ("label  45%  12.3 MB / 27.0 MB"). It draws only when stderr is a terminal,
+// never touches stdout (safe with --json), and throttles redraws.
+func Progress(label string) func(sent, total int64) {
+	if !isTTYFile(os.Stderr) {
+		return nil
+	}
+	var last time.Time
+	return func(sent, total int64) {
+		done := total > 0 && sent >= total
+		if !done && time.Since(last) < 100*time.Millisecond {
+			return
+		}
+		last = time.Now()
+		pct := 0
+		if total > 0 {
+			pct = int(sent * 100 / total)
+		}
+		const width = 24
+		filled := pct * width / 100
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+		fmt.Fprintf(os.Stderr, "\r%s %s %3d%%  %s / %s", label, bar, pct, humanBytes(sent), humanBytes(total))
+		if done {
+			fmt.Fprintln(os.Stderr)
+		}
+	}
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
 }

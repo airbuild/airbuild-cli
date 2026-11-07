@@ -2,32 +2,73 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/airbuild/airbuild-cli/internal/download"
+)
+
+// UserAgent is sent on every request; cmd.SetVersion fills in the version.
+var UserAgent = "airbuild-cli/dev"
+
+const (
+	// requestTimeout bounds ordinary JSON calls end to end.
+	requestTimeout = 60 * time.Second
+	// uploadResponseTimeout bounds how long the server may take to answer
+	// after a build upload finished sending (it parses the IPA/APK first).
+	uploadResponseTimeout = 10 * time.Minute
+	// maxAttempts is the total tries for idempotent (GET) requests.
+	maxAttempts = 3
 )
 
 // Client is the AirBuild API client used by the CLI.
 type Client struct {
 	BaseURL string
 	APIKey  string
-	HTTP    *http.Client
+	// HTTP serves ordinary JSON calls (bounded by requestTimeout).
+	HTTP *http.Client
+	// UploadHTTP serves file uploads: no overall timeout (a 2 GB upload on a
+	// slow link legitimately takes a long time), only connect/TLS/response limits.
+	UploadHTTP *http.Client
+	// Progress, when set, receives (sent, total) bytes while a file uploads.
+	Progress func(sent, total int64)
+	// backoff is the base retry delay (tests shrink it).
+	backoff time.Duration
+}
+
+func newTransport(responseHeaderTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
 }
 
 // New creates a new API client.
 func New(baseURL, apiKey string) *Client {
 	return &Client{
-		BaseURL: baseURL,
-		APIKey:  apiKey,
-		HTTP: &http.Client{
-			Timeout: 10 * time.Minute, // uploads can be large
-		},
+		BaseURL:    strings.TrimSuffix(baseURL, "/"),
+		APIKey:     apiKey,
+		HTTP:       &http.Client{Transport: newTransport(requestTimeout)},
+		UploadHTTP: &http.Client{Transport: newTransport(uploadResponseTimeout)},
+		backoff:    500 * time.Millisecond,
 	}
 }
 
@@ -41,44 +82,115 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("API error (HTTP %d): %s", e.StatusCode, e.Message)
 }
 
-// do performs an authenticated HTTP request and returns the response body.
-func (c *Client) do(method, path string, body io.Reader, contentType string) ([]byte, int, error) {
-	url := c.BaseURL + path
+// retryable reports whether a response status is worth retrying.
+func retryable(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
 
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return nil, 0, fmt.Errorf("could not create request: %w", err)
+// retryDelay honors Retry-After (seconds, capped) and otherwise backs off
+// exponentially with jitter.
+func (c *Client) retryDelay(attempt int, resp *http.Response) time.Duration {
+	if resp != nil {
+		if v := resp.Header.Get("Retry-After"); v != "" {
+			if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+				if secs > 30 {
+					secs = 30
+				}
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
+	d := c.backoff << attempt
+	return d + time.Duration(rand.Int63n(int64(d)/2+1))
+}
+
+// do performs an authenticated HTTP request and returns the response body.
+// Bodyless requests (GET) are retried on network errors, 429 and 502/503/504;
+// requests with a body are sent exactly once so a build is never uploaded
+// twice behind the user's back.
+func (c *Client) do(method, path string, body io.Reader, contentType string) ([]byte, int, error) {
+	var payload []byte
+	if body != nil {
+		var err error
+		if payload, err = io.ReadAll(body); err != nil {
+			return nil, 0, fmt.Errorf("could not read request body: %w", err)
+		}
+	}
+	attempts := 1
+	if method == http.MethodGet {
+		attempts = maxAttempts
 	}
 
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		var rdr io.Reader
+		if payload != nil {
+			rdr = bytes.NewReader(payload)
+		}
+		data, status, resp, err := c.send(c.HTTP, requestTimeout, method, path, rdr, -1, contentType)
+		if err == nil {
+			return data, status, nil
+		}
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && !retryable(status) {
+			return data, status, err
+		}
+		lastErr = err
+		if attempt < attempts-1 {
+			time.Sleep(c.retryDelay(attempt, resp))
+		}
+	}
+	return nil, 0, lastErr
+}
+
+// send issues one request. timeout <= 0 means no overall deadline.
+// contentLength < 0 lets net/http infer it.
+func (c *Client) send(hc *http.Client, timeout time.Duration, method, path string, body io.Reader, contentLength int64, contentType string) ([]byte, int, *http.Response, error) {
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, body)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("could not create request: %w", err)
+	}
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("User-Agent", UserAgent)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %w", err)
+		return nil, 0, nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("could not read response: %w", err)
+		return nil, resp.StatusCode, resp, fmt.Errorf("could not read response: %w", err)
 	}
-
 	if resp.StatusCode >= 400 {
-		var errBody struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(data, &errBody)
-		msg := errBody.Error
-		if msg == "" {
-			msg = string(data)
-		}
-		return data, resp.StatusCode, &APIError{StatusCode: resp.StatusCode, Message: msg}
+		return data, resp.StatusCode, resp, &APIError{StatusCode: resp.StatusCode, Message: errorMessage(data)}
 	}
+	return data, resp.StatusCode, resp, nil
+}
 
-	return data, resp.StatusCode, nil
+func errorMessage(data []byte) string {
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(data, &errBody)
+	if errBody.Error != "" {
+		return errBody.Error
+	}
+	return string(data)
 }
 
 // get performs a GET request and unmarshals the JSON response.
@@ -345,89 +457,124 @@ type CodePushStatusResponse struct {
 	} `json:"channels"`
 }
 
-// codePushMultipartUpload is a shared helper for the release/patch endpoints,
-// both of which take an appId + metadata fields + a single file.
-func (c *Client) codePushMultipartUpload(path string, filePath string, fields map[string]string) ([]byte, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("could not open file: %w", err)
-	}
-	defer file.Close()
-
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	for k, v := range fields {
-		if v == "" {
-			continue
-		}
-		if err := writer.WriteField(k, v); err != nil {
-			return nil, fmt.Errorf("could not write field %q: %w", k, err)
-		}
-	}
-
-	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
-	if err != nil {
-		return nil, fmt.Errorf("could not create file form field: %w", err)
-	}
-	if _, err := io.Copy(part, file); err != nil {
-		return nil, fmt.Errorf("could not copy file to buffer: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("could not close multipart writer: %w", err)
-	}
-
-	data, _, err := c.do("POST", path, &buf, writer.FormDataContentType())
-	return data, err
-}
-
-// MultipartFile is a single file to attach to a multi-file multipart
-// upload (see codePushMultipartUploadMulti) — used for React Native
-// publish, which uploads a JS bundle plus N asset files in one request.
+// MultipartFile is a single file to attach to a multipart upload — used for
+// React Native publish, which uploads a JS bundle plus N asset files in one
+// request.
 type MultipartFile struct {
 	FieldName string
 	FilePath  string
 }
 
-// codePushMultipartUploadMulti is like codePushMultipartUpload, but attaches
-// an arbitrary number of files (each under its own field name) instead of
-// exactly one under a fixed "file" field.
-func (c *Client) codePushMultipartUploadMulti(path string, fields map[string]string, files []MultipartFile) ([]byte, error) {
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
+// countingReader reports bytes read to a progress callback.
+type countingReader struct {
+	r     io.Reader
+	sent  *int64
+	total int64
+	cb    func(sent, total int64)
+}
 
-	for k, v := range fields {
-		if v == "" {
-			continue
-		}
-		if err := writer.WriteField(k, v); err != nil {
-			return nil, fmt.Errorf("could not write field %q: %w", k, err)
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		*c.sent += int64(n)
+		if c.cb != nil {
+			c.cb(*c.sent, c.total)
 		}
 	}
+	return n, err
+}
 
+// writeMultipart writes fields (sorted, so both passes frame identically) and
+// files into w. When dry is true file contents are skipped, which lets the
+// caller measure the exact framing overhead.
+func writeMultipart(w *multipart.Writer, fields map[string]string, files []MultipartFile, dry bool, sent *int64, total int64, cb func(int64, int64)) error {
+	keys := make([]string, 0, len(fields))
+	for k, v := range fields {
+		if v != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if err := w.WriteField(k, fields[k]); err != nil {
+			return fmt.Errorf("could not write field %q: %w", k, err)
+		}
+	}
 	for _, f := range files {
+		part, err := w.CreateFormFile(f.FieldName, filepath.Base(f.FilePath))
+		if err != nil {
+			return fmt.Errorf("could not create file form field %q: %w", f.FieldName, err)
+		}
+		if dry {
+			continue
+		}
 		file, err := os.Open(f.FilePath)
+		if err != nil {
+			return fmt.Errorf("could not open file %s: %w", f.FilePath, err)
+		}
+		_, err = io.Copy(part, &countingReader{r: file, sent: sent, total: total, cb: cb})
+		file.Close() //nolint:errcheck
+		if err != nil {
+			return fmt.Errorf("could not stream file %s: %w", f.FilePath, err)
+		}
+	}
+	return w.Close()
+}
+
+// postMultipart streams a multipart/form-data POST. Files are read straight
+// from disk through a pipe — memory use stays constant however large the
+// build is — and the exact Content-Length is computed up front so servers and
+// proxies that dislike chunked uploads work too. The request is sent once
+// (no automatic retry) so a build is never uploaded twice.
+func (c *Client) postMultipart(path string, fields map[string]string, files []MultipartFile) ([]byte, error) {
+	var total int64
+	for _, f := range files {
+		fi, err := os.Stat(f.FilePath)
 		if err != nil {
 			return nil, fmt.Errorf("could not open file %s: %w", f.FilePath, err)
 		}
-		part, err := writer.CreateFormFile(f.FieldName, filepath.Base(f.FilePath))
-		if err != nil {
-			file.Close()
-			return nil, fmt.Errorf("could not create file form field %q: %w", f.FieldName, err)
-		}
-		if _, err := io.Copy(part, file); err != nil {
-			file.Close()
-			return nil, fmt.Errorf("could not copy file %s to buffer: %w", f.FilePath, err)
-		}
-		file.Close()
+		total += fi.Size()
 	}
 
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("could not close multipart writer: %w", err)
-	}
+	boundary := multipart.NewWriter(io.Discard).Boundary()
 
-	data, _, err := c.do("POST", path, &buf, writer.FormDataContentType())
+	// Pass 1: measure the framing (headers, boundaries, fields) without file bytes.
+	var overhead bytes.Buffer
+	dry := multipart.NewWriter(&overhead)
+	if err := dry.SetBoundary(boundary); err != nil {
+		return nil, err
+	}
+	if err := writeMultipart(dry, fields, files, true, nil, 0, nil); err != nil {
+		return nil, err
+	}
+	contentLength := int64(overhead.Len()) + total
+
+	// Pass 2: stream the real body.
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	if err := mw.SetBoundary(boundary); err != nil {
+		return nil, err
+	}
+	var sent int64
+	go func() {
+		pw.CloseWithError(writeMultipart(mw, fields, files, false, &sent, total, c.Progress)) //nolint:errcheck
+	}()
+
+	data, _, _, err := c.send(c.UploadHTTP, 0, http.MethodPost, path, pr, contentLength, mw.FormDataContentType())
+	pr.Close() //nolint:errcheck
 	return data, err
+}
+
+// codePushMultipartUpload is a shared helper for the release/patch endpoints,
+// which upload a single artifact under the "file" field plus text fields.
+func (c *Client) codePushMultipartUpload(path string, filePath string, fields map[string]string) ([]byte, error) {
+	return c.postMultipart(path, fields, []MultipartFile{{FieldName: "file", FilePath: filePath}})
+}
+
+// codePushMultipartUploadMulti is like codePushMultipartUpload, but attaches
+// an arbitrary number of files (each under its own field name).
+func (c *Client) codePushMultipartUploadMulti(path string, fields map[string]string, files []MultipartFile) ([]byte, error) {
+	return c.postMultipart(path, fields, files)
 }
 
 // --- CodePush (React Native) types ---
@@ -776,75 +923,23 @@ func (c *Client) CodePushFlutterSigningKey(appID string) (*CodePushSigningKeyRes
 	return &resp, nil
 }
 
-// DownloadFile downloads a URL to a local file, returning the file path.
-// Used to fetch release artifacts from signed storage URLs.
+// DownloadFile fetches a (signed) URL to destPath atomically, with connect and
+// stall timeouts and no Authorization header (signed URLs carry their own auth).
 func (c *Client) DownloadFile(fileURL, destPath string) error {
-	resp, err := c.HTTP.Get(fileURL)
-	if err != nil {
+	if _, err := download.ToFile(fileURL, destPath, false); err != nil {
 		return fmt.Errorf("download failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("download failed (HTTP %d)", resp.StatusCode)
-	}
-	out, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("could not create file: %w", err)
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return fmt.Errorf("could not write file: %w", err)
 	}
 	return nil
 }
 
-// Upload uploads a build file (IPA/APK) to a specific app.
-// progress is an optional callback called with bytes uploaded (not implemented
-// yet — net/http doesn't easily expose multipart progress without a custom
-// reader).
+// Upload streams a build file (IPA/APK) to a specific app. Set c.Progress to
+// receive (sent, total) byte counts while it uploads.
 func (c *Client) Upload(filePath, appID, platform, releaseNotes string) (*UploadResponse, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("could not open file: %w", err)
-	}
-	defer file.Close()
-
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	// appId field
-	if err := writer.WriteField("appId", appID); err != nil {
-		return nil, fmt.Errorf("could not write appId field: %w", err)
-	}
-
-	// platform field (optional — server auto-detects from extension)
-	if platform != "" {
-		if err := writer.WriteField("platform", platform); err != nil {
-			return nil, fmt.Errorf("could not write platform field: %w", err)
-		}
-	}
-
-	// releaseNotes field (optional)
-	if releaseNotes != "" {
-		if err := writer.WriteField("releaseNotes", releaseNotes); err != nil {
-			return nil, fmt.Errorf("could not write releaseNotes field: %w", err)
-		}
-	}
-
-	// file field
-	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
-	if err != nil {
-		return nil, fmt.Errorf("could not create file form field: %w", err)
-	}
-	if _, err := io.Copy(part, file); err != nil {
-		return nil, fmt.Errorf("could not copy file to buffer: %w", err)
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("could not close multipart writer: %w", err)
-	}
-
-	data, _, err := c.do("POST", "/api/upload", &buf, writer.FormDataContentType())
+	data, err := c.postMultipart("/api/upload", map[string]string{
+		"appId":        appID,
+		"platform":     platform,
+		"releaseNotes": releaseNotes,
+	}, []MultipartFile{{FieldName: "file", FilePath: filePath}})
 	if err != nil {
 		return nil, err
 	}

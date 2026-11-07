@@ -26,13 +26,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/airbuild/airbuild-cli/internal/download"
 )
 
 // iosSupplementNames are the link supplement files Shorebird's engine can
@@ -357,29 +358,16 @@ func EnsureAotTools() (string, error) {
 		return dillPath, nil
 	}
 	url := fmt.Sprintf("https://storage.googleapis.com/download.shorebird.dev/shorebird/%s/aot-tools.dill", engineRev)
-	resp, err := http.Get(url) //nolint:gosec // fixed shorebird.dev host
-	if err != nil {
-		return "", fmt.Errorf("failed to download aot-tools: %w", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to download aot-tools: GET %s: %s", url, resp.Status)
-	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(outDir, "aot-tools-*.dill.tmp")
+	res, err := download.ToFile(url, dillPath, false)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to download aot-tools: %w", err)
 	}
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()           //nolint:errcheck
-		os.Remove(tmp.Name()) //nolint:errcheck
-		return "", fmt.Errorf("failed to write aot-tools: %w", err)
-	}
-	tmp.Close() //nolint:errcheck
-	if err := os.Rename(tmp.Name(), dillPath); err != nil {
-		return "", err
+	if err := res.VerifyGoogleHash(); err != nil {
+		os.Remove(dillPath) //nolint:errcheck
+		return "", fmt.Errorf("failed to download aot-tools: %w", err)
 	}
 	return dillPath, nil
 }

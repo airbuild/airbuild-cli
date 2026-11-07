@@ -2,15 +2,18 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/airbuild/airbuild-cli/internal/download"
 	"github.com/airbuild/airbuild-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -18,149 +21,205 @@ import (
 // GitHubRepo is the GitHub repository for release checks.
 const GitHubRepo = "airbuild/airbuild-cli"
 
-var upgradeCheck bool
-var upgradeYes bool
+var (
+	upgradeCheck   bool
+	upgradeYes     bool
+	upgradeVersion string
+)
 
 var upgradeCmd = &cobra.Command{
 	Use:   "upgrade",
-	Short: "Upgrade AirBuild CLI to the latest version",
+	Short: "Upgrade AirBuild CLI to the latest (or a specific) version",
 	Long: `Check for a newer version of the AirBuild CLI and upgrade if available.
 
-The command checks the latest release on GitHub, compares it with the
-current version, and downloads + replaces the binary in place.
+The command checks the release on GitHub, compares it with the current
+version, downloads the binary for your platform, verifies its SHA-256 against
+the release's checksums.txt, and replaces the binary in place. A release
+without a matching checksum is refused.
 
 Examples:
-  airbuild upgrade           # Upgrade to latest version
-  airbuild upgrade --check   # Only check if an update is available`,
-	Run: func(cmd *cobra.Command, args []string) {
+  airbuild upgrade                    # Upgrade to the latest version
+  airbuild upgrade --check            # Only check if an update is available
+  airbuild upgrade --version v1.2.0   # Install a specific version (also downgrades)`,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		assumeYes = upgradeYes
-		runUpgrade()
+		return runUpgrade()
 	},
 }
 
 func init() {
 	upgradeCmd.Flags().BoolVar(&upgradeCheck, "check", false, "Only check if an update is available (don't upgrade)")
 	upgradeCmd.Flags().BoolVar(&upgradeYes, "yes", false, "Non-interactive: answer yes to prompts")
+	upgradeCmd.Flags().StringVar(&upgradeVersion, "version", "", "Install this version (e.g. v1.2.0) instead of the latest")
 	rootCmd.AddCommand(upgradeCmd)
+}
+
+// githubAsset is a release asset.
+type githubAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+	Size               int64  `json:"size"`
 }
 
 // githubRelease represents the relevant fields from GitHub's release API.
 type githubRelease struct {
-	TagName string `json:"tag_name"`
-	Name    string `json:"name"`
-	Assets  []struct {
-		Name               string `json:"name"`
-		BrowserDownloadURL string `json:"browser_download_url"`
-		Size               int64  `json:"size"`
-	} `json:"assets"`
+	TagName string        `json:"tag_name"`
+	Name    string        `json:"name"`
+	Assets  []githubAsset `json:"assets"`
 }
 
+// githubAPI is the API base, a variable so tests can point it at a stub.
+var githubAPI = "https://api.github.com"
+
+// executablePath locates the running binary; tests replace it so they never
+// touch the real executable.
+var executablePath = os.Executable
+
+// checksumsAsset is the release asset listing SHA-256 sums for every binary.
+const checksumsAsset = "checksums.txt"
+
 // runUpgrade checks for a new version and performs the upgrade.
-func runUpgrade() {
+func runUpgrade() error {
 	currentVersion := cliVersion
 	if currentVersion == "dev" {
 		ui.Warn("You're running a development build (version unknown).")
-		if !upgradeCheck {
+		if !upgradeCheck && upgradeVersion == "" {
 			if !confirm("Upgrade to the latest release anyway?", true) {
 				ui.Info("Aborted.")
-				return
+				return nil
 			}
 		}
 	}
 
-	// Fetch latest release from GitHub API
 	ui.Info("Checking for updates...")
-	latest, err := fetchLatestRelease()
+	release, err := fetchRelease(upgradeVersion)
 	if err != nil {
 		ui.Muted("You can manually download from https://github.com/%s/releases", GitHubRepo)
-		fail("Could not check for updates: %v", err)
+		return failf("Could not check for updates: %v", err)
 	}
 
 	// Parse version from tag (cli-v1.1.0 → v1.1.0)
-	latestVersion := strings.TrimPrefix(latest.TagName, "cli-")
-
+	targetVersion := strings.TrimPrefix(release.TagName, "cli-")
 	ui.Info("Current version: %s", currentVersion)
-	ui.Info("Latest version:  %s", latestVersion)
+	ui.Info("Target version:  %s", targetVersion)
 
-	if currentVersion == latestVersion {
-		ui.Success("You're already on the latest version.")
-		return
+	if currentVersion == targetVersion {
+		ui.Success("You're already on %s.", targetVersion)
+		return nil
 	}
-
-	if currentVersion != "dev" && !isNewerVersion(currentVersion, latestVersion) {
-		ui.Info("Current version (%s) is newer than latest release (%s).", currentVersion, latestVersion)
-		return
+	// Pinning a version always installs it (including downgrades); the
+	// "latest" path never goes backwards.
+	if upgradeVersion == "" && currentVersion != "dev" && !isNewerVersion(currentVersion, targetVersion) {
+		ui.Info("Current version (%s) is newer than latest release (%s).", currentVersion, targetVersion)
+		return nil
 	}
-
 	if upgradeCheck {
 		ui.Info("Update available! Run `airbuild upgrade` to install it.")
-		return
+		return nil
 	}
 
-	// Find the matching asset for this platform
 	assetName := buildAssetName()
-	asset := findAsset(latest, assetName)
+	asset := findAsset(release, assetName)
 	if asset == nil {
 		ui.Muted("Available assets:")
-		for _, a := range latest.Assets {
+		for _, a := range release.Assets {
 			ui.Muted("  %s", a.Name)
 		}
-		fail("No binary found for %s in release %s", assetName, latestVersion)
+		return failf("No binary found for %s in release %s", assetName, targetVersion)
+	}
+	sums := findAsset(release, checksumsAsset)
+	if sums == nil {
+		return failf("Release %s has no %s — refusing to install an unverified binary. "+
+			"Download it manually from https://github.com/%s/releases", targetVersion, checksumsAsset, GitHubRepo)
 	}
 
-	// Find the current binary path
-	binaryPath, err := os.Executable()
+	binaryPath, err := executablePath()
 	if err != nil {
-		fail("Could not determine current binary path: %v", err)
+		return failf("Could not determine current binary path: %v", err)
 	}
 	binaryPath, _ = filepath.EvalSymlinks(binaryPath)
+	dir := filepath.Dir(binaryPath)
+	if err := checkWritable(dir); err != nil {
+		return failf("%s is not writable (%v).\n  Re-run with elevated permissions (e.g. `sudo airbuild upgrade`), "+
+			"or reinstall into a user directory: AIRBUILD_INSTALL_DIR=$HOME/.local/bin (see install.sh).", dir, err)
+	}
 
 	ui.Info("Downloading %s (%s)...", asset.Name, formatFileSize(asset.Size))
+	raw, err := download.GetBytes(sums.BrowserDownloadURL, 1<<20)
+	if err != nil {
+		return failf("Could not fetch %s: %v", checksumsAsset, err)
+	}
+	checksums := download.ParseChecksums(string(raw))
 
-	// Download to a temp file
 	tmpPath := binaryPath + ".new"
-	if err := downloadFile(asset.BrowserDownloadURL, tmpPath); err != nil {
-		os.Remove(tmpPath)
-		fail("Download failed: %v", err)
+	res, err := download.ToFile(asset.BrowserDownloadURL, tmpPath, runtime.GOOS != "windows")
+	if err != nil {
+		os.Remove(tmpPath) //nolint:errcheck
+		return failf("Download failed: %v", err)
 	}
-
-	// Make it executable (Unix only)
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(tmpPath, 0755); err != nil {
-			os.Remove(tmpPath)
-			fail("Could not make binary executable: %v", err)
-		}
+	if err := download.VerifySHA256(checksums, asset.Name, res.SHA256); err != nil {
+		os.Remove(tmpPath) //nolint:errcheck
+		return failf("Integrity check failed: %v", err)
 	}
+	ui.Muted("SHA-256 verified: %s", res.SHA256)
 
-	// Backup the old binary
+	// Swap the binary. On Windows a running exe can be renamed but not
+	// deleted, so the old file may be left behind as .old (removed next time).
 	backupPath := binaryPath + ".old"
-	os.Remove(backupPath)
-
-	// On Windows, we can't rename a running binary directly.
-	// Rename the current binary to .old first, then move the new one in.
+	os.Remove(backupPath) //nolint:errcheck
 	if err := os.Rename(binaryPath, backupPath); err != nil {
-		os.Remove(tmpPath)
-		fail("Could not backup current binary: %v", err)
+		os.Remove(tmpPath) //nolint:errcheck
+		return failf("Could not back up current binary: %v", err)
 	}
-
-	// Move new binary into place
 	if err := os.Rename(tmpPath, binaryPath); err != nil {
-		// Restore the old binary
-		os.Rename(backupPath, binaryPath)
-		os.Remove(tmpPath)
-		fail("Could not install new binary: %v", err)
+		os.Rename(backupPath, binaryPath) //nolint:errcheck
+		os.Remove(tmpPath)                //nolint:errcheck
+		return failf("Could not install new binary: %v", err)
 	}
+	os.Remove(backupPath) //nolint:errcheck
 
-	// Clean up backup (best effort)
-	os.Remove(backupPath)
-
-	ui.Success("Upgraded to %s", latestVersion)
+	ui.Success("Upgraded to %s", targetVersion)
 	ui.Info("Run `airbuild version` to verify.")
+
+	// Refresh AirBuild-managed agent files in the current project using the NEW
+	// binary (it carries the new content). Best effort; never creates files.
+	syncCmd := exec.Command(binaryPath, "agents", "sync", "--quiet")
+	syncCmd.Stdout, syncCmd.Stderr = os.Stderr, os.Stderr
+	_ = syncCmd.Run()
+	return nil
 }
 
-// fetchLatestRelease queries the GitHub API for the latest release.
-func fetchLatestRelease() (*githubRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", GitHubRepo)
+// checkWritable verifies we can create files in dir (needed for the atomic
+// rename) and returns a short reason when we can't.
+func checkWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".airbuild-write-test-*")
+	if err != nil {
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			return pe.Err
+		}
+		return err
+	}
+	name := f.Name()
+	f.Close()       //nolint:errcheck
+	os.Remove(name) //nolint:errcheck
+	return nil
+}
+
+// fetchRelease queries the GitHub API for the latest release, or for the
+// given version (v1.2.0 or cli-v1.2.0) when pinned.
+func fetchRelease(version string) (*githubRelease, error) {
+	url := fmt.Sprintf("%s/repos/%s/releases/latest", githubAPI, GitHubRepo)
+	if version != "" {
+		tag := version
+		if !strings.HasPrefix(tag, "cli-") {
+			if !strings.HasPrefix(tag, "v") {
+				tag = "v" + tag
+			}
+			tag = "cli-" + tag
+		}
+		url = fmt.Sprintf("%s/repos/%s/releases/tags/%s", githubAPI, GitHubRepo, tag)
+	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
@@ -168,13 +227,17 @@ func fetchLatestRelease() (*githubRelease, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", userAgent())
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
+	if resp.StatusCode == http.StatusNotFound && version != "" {
+		return nil, fmt.Errorf("version %s not found", version)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API returned HTTP %d", resp.StatusCode)
 	}
@@ -183,7 +246,6 @@ func fetchLatestRelease() (*githubRelease, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return nil, fmt.Errorf("could not parse release response: %w", err)
 	}
-
 	return &release, nil
 }
 
@@ -197,40 +259,13 @@ func buildAssetName() string {
 }
 
 // findAsset finds a release asset matching the given name.
-func findAsset(release *githubRelease, name string) *struct {
-	Name               string `json:"name"`
-	BrowserDownloadURL string `json:"browser_download_url"`
-	Size               int64  `json:"size"`
-} {
+func findAsset(release *githubRelease, name string) *githubAsset {
 	for i := range release.Assets {
 		if release.Assets[i].Name == name {
 			return &release.Assets[i]
 		}
 	}
 	return nil
-}
-
-// downloadFile downloads a URL to a local file path.
-func downloadFile(url, destPath string) error {
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	out, err := os.Create(destPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	return err
 }
 
 // isNewerVersion compares two version strings (e.g. "v1.0.0" vs "v1.1.0").

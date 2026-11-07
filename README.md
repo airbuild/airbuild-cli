@@ -107,7 +107,9 @@ Every command accepts `--json`: stdout carries only JSON while progress
 and errors go to stderr, and failures exit non-zero. Use it in scripts,
 CI, and AI agents. `init` and `upgrade` also accept `--yes` for
 non-interactive runs; `init --agents` writes `AGENTS.md`/`CLAUDE.md`
-instruction files so coding agents know how to use AirBuild.
+plus two skills (`airbuild-distribution`, `airbuild-codepush`) so coding agents
+know how to use AirBuild; the skills run `airbuild guide <topic>` for
+version-matched runbooks. `airbuild agents sync|check` keeps those files current.
 
 ### `airbuild init`
 Create a `.airbuild.json` config file for your project. Enables `airbuild push`.

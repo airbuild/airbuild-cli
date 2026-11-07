@@ -33,16 +33,19 @@ Examples:
   airbuild push --platform ios --debug       # Push iOS debug
   airbuild push --all                        # Push both platforms
   airbuild push --json                       # JSON output for CI/CD`,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		// Load project config
 		projCfg, err := project.Load()
 		if err != nil {
 			ui.Error("%v", err)
 			ui.Info("Run `airbuild init` to set up your project first.")
-			os.Exit(1)
+			return errSilent
 		}
 
-		cfg := mustLoadConfig()
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		// Determine build type
@@ -51,7 +54,7 @@ Examples:
 			buildType = "debug"
 		}
 		if pushRelease && pushDebug {
-			fail("Cannot specify both --release and --debug")
+			return failf("Cannot specify both --release and --debug")
 		}
 
 		// Determine which platforms to push
@@ -69,7 +72,7 @@ Examples:
 				} else {
 					ui.Info("No platforms found in config. Check your .airbuild.json — the 'builds' key may be missing or empty.")
 				}
-				os.Exit(1)
+				return errSilent
 			}
 			platformsToPush = []string{p}
 		} else {
@@ -79,16 +82,16 @@ Examples:
 			} else if len(configuredPlatforms) == 0 {
 				ui.Error("No platforms configured in .airbuild.json")
 				ui.Info("Run `airbuild init` to configure build paths.")
-				os.Exit(1)
+				return errSilent
 			} else {
 				ui.Error("Multiple platforms configured. Specify --platform or --all.")
 				ui.Info("Configured platforms: %s", strings.Join(configuredPlatforms, ", "))
-				os.Exit(1)
+				return errSilent
 			}
 		}
 
 		if len(platformsToPush) == 0 {
-			fail("No platforms to push")
+			return failf("No platforms to push")
 		}
 
 		// Upload each platform
@@ -108,9 +111,10 @@ Examples:
 		// Exit with error if any upload failed
 		for _, r := range results {
 			if r.Error != "" {
-				os.Exit(1)
+				return errSilent
 			}
 		}
+		return nil
 	},
 }
 
@@ -168,6 +172,7 @@ func pushSingle(client *api.Client, projCfg *project.ProjectConfig, platform, bu
 	sizeStr := formatFileSize(info.Size())
 	ui.Info("Uploading %s (%s, %s)...", filepath.Base(filePath), platform, sizeStr)
 
+	client.Progress = ui.Progress("Uploading")
 	start := time.Now()
 	resp, err := client.Upload(filePath, projCfg.AppID, apiPlatform, pushReleaseNotes)
 	if err != nil {

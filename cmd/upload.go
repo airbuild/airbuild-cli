@@ -28,19 +28,19 @@ Examples:
   airbuild upload ./build/app-release.apk --app-id app_xxx
   airbuild upload ./MyApp.ipa --app-id app_xxx --release-notes "Bug fixes"`,
 	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		filePath := args[0]
 
 		// Validate file exists
 		info, err := os.Stat(filePath)
 		if err != nil {
-			fail("File not found: %s", filePath)
+			return failf("File not found: %s", filePath)
 		}
 
 		// Validate file extension
 		ext := strings.ToLower(filepath.Ext(filePath))
 		if ext != ".ipa" && ext != ".apk" {
-			fail("File must be .ipa or .apk, got: %s", ext)
+			return failf("File must be .ipa or .apk, got: %s", ext)
 		}
 
 		// Auto-detect platform if not specified
@@ -54,31 +54,35 @@ Examples:
 		} else {
 			platform = strings.ToUpper(platform)
 			if platform != "IOS" && platform != "ANDROID" {
-				fail("Invalid platform: %s (must be IOS or ANDROID)", platform)
+				return failf("Invalid platform: %s (must be IOS or ANDROID)", platform)
 			}
 		}
 
 		if uploadAppID == "" {
-			fail("--app-id is required. Run `airbuild apps list` to see your apps.")
+			return failf("--app-id is required. Run `airbuild apps list` to see your apps.")
 		}
 
-		cfg := mustLoadConfig()
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		// Format file size
 		sizeStr := formatFileSize(info.Size())
 		ui.Info("Uploading %s (%s, %s)...", filepath.Base(filePath), platform, sizeStr)
 
+		client.Progress = ui.Progress("Uploading")
 		start := time.Now()
 		resp, err := client.Upload(filePath, uploadAppID, platform, uploadReleaseNotes)
 		if err != nil {
-			fail("Upload failed: %v", err)
+			return failf("Upload failed: %v", err)
 		}
 		elapsed := time.Since(start).Round(time.Millisecond)
 
 		if jsonOutput {
 			ui.PrintJSON(resp)
-			return
+			return nil
 		}
 
 		ui.Success("Upload complete in %s", elapsed)
@@ -96,6 +100,7 @@ Examples:
 		)
 		fmt.Println()
 		ui.Info("Install URL: %s", resp.InstallURL)
+		return nil
 	},
 }
 

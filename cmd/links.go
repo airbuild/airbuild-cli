@@ -19,27 +19,30 @@ var linksCmd = &cobra.Command{
 var linksListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List install links for an app",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		if linksAppID == "" {
-			fail("--app-id is required. Run `airbuild apps list` to see your apps.")
+			return failf("--app-id is required. Run `airbuild apps list` to see your apps.")
 		}
 
-		cfg := mustLoadConfig()
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		resp, err := client.ListLinks(linksAppID)
 		if err != nil {
-			fail("Failed to list links: %v", err)
+			return failf("Failed to list links: %v", err)
 		}
 
 		if jsonOutput {
 			ui.PrintJSON(resp)
-			return
+			return nil
 		}
 
 		if len(resp.Links) == 0 {
 			ui.Info("No install links found for this app.")
-			return
+			return nil
 		}
 
 		ui.Header("Install Links (%d)", len(resp.Links))
@@ -63,28 +66,32 @@ var linksListCmd = &cobra.Command{
 			})
 		}
 		ui.Table([]string{"Slug", "Status", "Version", "Platform", "Downloads", "Expires"}, rows)
+		return nil
 	},
 }
 
 var linksCreateCmd = &cobra.Command{
 	Use:   "create",
 	Short: "Create a new install link for a build",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		if linksBuildID == "" {
-			fail("--build-id is required. Run `airbuild builds list --app-id xxx` to see builds.")
+			return failf("--build-id is required. Run `airbuild builds list --app-id xxx` to see builds.")
 		}
 
-		cfg := mustLoadConfig()
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
 		client := api.New(cfg.APIURL, cfg.APIKey)
 
 		resp, err := client.CreateLink(linksBuildID)
 		if err != nil {
-			fail("Failed to create link: %v", err)
+			return failf("Failed to create link: %v", err)
 		}
 
 		if jsonOutput {
 			ui.PrintJSON(resp)
-			return
+			return nil
 		}
 
 		ui.Success("Install link created")
@@ -100,6 +107,7 @@ var linksCreateCmd = &cobra.Command{
 		)
 		fmt.Println()
 		ui.Info("Install URL: %s/i/%s", cfg.APIURL, resp.Link.Slug)
+		return nil
 	},
 }
 

@@ -8,10 +8,12 @@ import (
 )
 
 // Config is the persisted CLI configuration stored at ~/.airbuild/config.json.
+// It holds credentials and server settings only — the app a project deploys to
+// lives in the project's .airbuild.json, never here. (A legacy "appId" key in
+// an existing file is ignored and dropped on the next save.)
 type Config struct {
 	APIKey  string `json:"apiKey"`
 	APIURL  string `json:"apiUrl"`
-	AppID   string `json:"appId,omitempty"`
 	OrgID   string `json:"orgId,omitempty"`
 	OrgName string `json:"orgName,omitempty"`
 }
@@ -120,7 +122,25 @@ func (c *Config) Save() error {
 	if err != nil {
 		return fmt.Errorf("could not marshal config: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	// Write to a private temp file and rename so a crash can never leave a
+	// truncated config (and the key never exists with loose permissions).
+	tmp, err := os.CreateTemp(dir, "config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("could not write config: %w", err)
+	}
+	defer os.Remove(tmp.Name()) //nolint:errcheck
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close() //nolint:errcheck
+		return fmt.Errorf("could not write config: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close() //nolint:errcheck
+		return fmt.Errorf("could not write config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("could not write config: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("could not write config: %w", err)
 	}
 	return nil
