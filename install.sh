@@ -10,11 +10,30 @@
 #   curl -fsSL .../install.sh | AIRBUILD_INSTALL_DIR=$HOME/bin bash
 #
 # The binary is verified against the release's checksums.txt (SHA-256) before
-# it is installed; a missing or mismatching checksum aborts the install.
+# it is installed; checksums.txt itself is verified against an RSA-SHA256
+# signature (checksums.txt.sig) made by AirBuild's release key, whose public
+# half is pinned below. A missing signature or checksum aborts the install.
 #
 set -euo pipefail
 
 REPO="airbuild/airbuild-cli"
+
+# AirBuild release-signing public key (RSA-3072). The private key lives only in
+# the GitHub release workflow's secrets. Pinned here so a tampered release —
+# including a swapped checksums.txt — fails verification.
+read -r -d '' RELEASE_PUBKEY <<'PUBKEY' || true
+-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAqm+iSCXUFOy3XZpQkDIP
+Fur3jpGQdMJtEO3C1JJQq6933UslsKgQLS6dmU7xeQfGflN97bHn94FlP9wVBSeb
+or2Es2DybU9CMGnUE3OJjffRnRDLxN5oc9ip1qNyVUbe/I0wX6lhXLSU3Ez56RG8
+P/1zQzpqMu90/9gi8Ejnnyt5w1kZtqaiixGGznIEyWbt1Lx/H1u6qejf8ByCs0eJ
+cVe9nWlkhPQ7KkkPVe/KVBr62hMqr+Eb3rHV/azYVOkb69dh09H+uOoebhop0jWY
+bWDRK6C1EFfzz2gIGFwst9L7CyUUIfLkekrL6jUZih57biLm6AS4X+Mr5AQZxLX9
+f7oPHLXYKP10jlEtKDZ5eyNwRFeVzYlcd68XjMwpiUDEx9MTu51zE8Vh6VLL1jC3
+Yhnct+aF+BtwwzzQJCUbIxg3ExwnWAMbmaIebKp7f+mUD7u30lSZgulSxvgJeP1e
+cZFjOMuBNv6AqUGFCtHaptCUS0GSp9uqjbAOm4cMWOynAgMBAAE=
+-----END PUBLIC KEY-----
+PUBKEY
 
 # Colors
 if [ -t 1 ]; then
@@ -89,7 +108,9 @@ fi
 # --- Download binary + checksums ---
 TMPFILE="$(mktemp -t airbuild.XXXXXX)"
 SUMFILE="$(mktemp -t airbuild-sums.XXXXXX)"
-trap 'rm -f "$TMPFILE" "$SUMFILE"' EXIT
+SIGFILE="$(mktemp -t airbuild-sig.XXXXXX)"
+PUBFILE="$(mktemp -t airbuild-pub.XXXXXX)"
+trap 'rm -f "$TMPFILE" "$SUMFILE" "$SIGFILE" "$PUBFILE"' EXIT
 
 info "Downloading ${BINARY}..."
 if ! curl -fsSL --connect-timeout 15 --max-time 600 "${BASE_URL}/${BINARY}" -o "$TMPFILE"; then
@@ -102,6 +123,23 @@ if ! curl -fsSL --connect-timeout 15 --max-time 60 "${BASE_URL}/checksums.txt" -
   err "Could not download checksums.txt — refusing to install an unverified binary."
   exit 1
 fi
+if ! curl -fsSL --connect-timeout 15 --max-time 60 "${BASE_URL}/checksums.txt.sig" -o "$SIGFILE"; then
+  err "Could not download checksums.txt.sig — refusing to install an unsigned release."
+  exit 1
+fi
+
+# --- Verify authenticity: checksums.txt was signed by AirBuild's release key ---
+if ! command -v openssl >/dev/null 2>&1; then
+  err "openssl not found — cannot verify the release signature."
+  exit 1
+fi
+printf '%s' "$RELEASE_PUBKEY" > "$PUBFILE"
+if ! openssl dgst -sha256 -verify "$PUBFILE" -signature "$SIGFILE" "$SUMFILE" >/dev/null 2>&1; then
+  err "Release signature verification failed — this release was not signed by AirBuild."
+  err "Refusing to install."
+  exit 1
+fi
+ok "Release signature verified"
 
 # --- Verify integrity ---
 EXPECTED="$(awk -v f="$BINARY" '{n=$2; sub(/^\*/,"",n)} n==f {print $1}' "$SUMFILE" | head -n1)"

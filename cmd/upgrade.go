@@ -1,6 +1,12 @@
 package cmd
 
 import (
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	_ "embed"
+	"encoding/pem"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,7 +82,50 @@ var githubAPI = "https://api.github.com"
 var executablePath = os.Executable
 
 // checksumsAsset is the release asset listing SHA-256 sums for every binary.
+// checksumSigAsset is the RSA-SHA256 signature over checksums.txt, produced by
+// the release workflow and verified against the release public key embedded in
+// this binary. Signature (authenticity) + checksum (integrity) means a tampered
+// release fails even if every asset on it was replaced.
 const checksumsAsset = "checksums.txt"
+const checksumSigAsset = "checksums.txt.sig"
+
+// releasePubPEM is the AirBuild release-signing public key, baked in at build
+// time. The matching private key lives only in the GitHub release workflow's
+// secrets — never in this repository.
+//
+//go:embed release-sign-pub.pem
+var releasePubPEM []byte
+
+// releasePublicKey parses the embedded RSA public key. A var so tests can
+// substitute a throwaway keypair.
+var releasePublicKey = func() (*rsa.PublicKey, error) {
+	block, _ := pem.Decode(releasePubPEM)
+	if block == nil {
+		return nil, fmt.Errorf("embedded release public key is not valid PEM")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse release public key: %w", err)
+	}
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("release public key is not RSA")
+	}
+	return rsaPub, nil
+}
+
+// verifyReleaseSignature checks an RSA-PKCS1v15 SHA-256 signature over data.
+func verifyReleaseSignature(data, sig []byte) error {
+	pub, err := releasePublicKey()
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(data)
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], sig); err != nil {
+		return fmt.Errorf("signature verification failed — the release was not signed by AirBuild")
+	}
+	return nil
+}
 
 // runUpgrade checks for a new version and performs the upgrade.
 func runUpgrade() error {
@@ -132,6 +181,11 @@ func runUpgrade() error {
 		return failf("Release %s has no %s — refusing to install an unverified binary. "+
 			"Download it manually from https://github.com/%s/releases", targetVersion, checksumsAsset, GitHubRepo)
 	}
+	sig := findAsset(release, checksumSigAsset)
+	if sig == nil {
+		return failf("Release %s has no %s — refusing to install an unsigned release. "+
+			"Download it manually from https://github.com/%s/releases", targetVersion, checksumSigAsset, GitHubRepo)
+	}
 
 	binaryPath, err := executablePath()
 	if err != nil {
@@ -149,6 +203,14 @@ func runUpgrade() error {
 	if err != nil {
 		return failf("Could not fetch %s: %v", checksumsAsset, err)
 	}
+	sigBytes, err := download.GetBytes(sig.BrowserDownloadURL, 1<<20)
+	if err != nil {
+		return failf("Could not fetch %s: %v", checksumSigAsset, err)
+	}
+	if err := verifyReleaseSignature(raw, sigBytes); err != nil {
+		return failf("%v", err)
+	}
+	ui.Muted("Release signature verified")
 	checksums := download.ParseChecksums(string(raw))
 
 	tmpPath := binaryPath + ".new"

@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -41,6 +44,27 @@ func setupUpgrade(t *testing.T, sums func(assetName, sha string) string, omitSum
 	sha := hex.EncodeToString(sum[:])
 	asset := buildAssetName()
 
+	// Throwaway signing keypair for the fixture — the real key never enters tests.
+	testKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumsBody := func() []byte {
+		body := sha + "  " + asset + "\n"
+		if sums != nil {
+			body = sums(asset, sha)
+		}
+		return []byte(body)
+	}
+	sigFor := func(data []byte) []byte {
+		digest := sha256.Sum256(data)
+		sig, err := rsa.SignPKCS1v15(rand.Reader, testKey, crypto.SHA256, digest[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sig
+	}
+
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fx.requests = append(fx.requests, r.URL.Path)
@@ -52,17 +76,16 @@ func setupUpgrade(t *testing.T, sums func(assetName, sha string) string, omitSum
 			}
 			assets := fmt.Sprintf(`{"name":%q,"browser_download_url":"%s/bin","size":%d}`, asset, srv.URL, len(newBinary))
 			if !omitSums {
-				assets += fmt.Sprintf(`,{"name":"checksums.txt","browser_download_url":"%s/sums","size":10}`, srv.URL)
+				assets += fmt.Sprintf(`,{"name":"checksums.txt","browser_download_url":"%s/sums","size":10}`+
+					`,{"name":"checksums.txt.sig","browser_download_url":"%s/sig","size":10}`, srv.URL, srv.URL)
 			}
 			fmt.Fprintf(w, `{"tag_name":%q,"assets":[%s]}`, tag, assets)
 		case r.URL.Path == "/bin":
 			w.Write([]byte(newBinary)) //nolint:errcheck
 		case r.URL.Path == "/sums":
-			body := sha + "  " + asset + "\n"
-			if sums != nil {
-				body = sums(asset, sha)
-			}
-			w.Write([]byte(body)) //nolint:errcheck
+			w.Write(sumsBody()) //nolint:errcheck
+		case r.URL.Path == "/sig":
+			w.Write(sigFor(sumsBody())) //nolint:errcheck
 		default:
 			http.NotFound(w, r)
 		}
@@ -71,6 +94,8 @@ func setupUpgrade(t *testing.T, sums func(assetName, sha string) string, omitSum
 
 	oldAPI, oldExe, oldVer := githubAPI, executablePath, cliVersion
 	oldCheck, oldYes, oldPin := upgradeCheck, upgradeYes, upgradeVersion
+	oldPub := releasePublicKey
+	releasePublicKey = func() (*rsa.PublicKey, error) { return &testKey.PublicKey, nil }
 	githubAPI = srv.URL
 	executablePath = func() (string, error) { return fx.exe, nil }
 	cliVersion = "v1.0.0"
@@ -78,6 +103,7 @@ func setupUpgrade(t *testing.T, sums func(assetName, sha string) string, omitSum
 	t.Cleanup(func() {
 		githubAPI, executablePath, cliVersion = oldAPI, oldExe, oldVer
 		upgradeCheck, upgradeYes, upgradeVersion = oldCheck, oldYes, oldPin
+		releasePublicKey = oldPub
 	})
 	return fx
 }
@@ -216,5 +242,26 @@ func TestIsNewerVersion(t *testing.T) {
 		if got := isNewerVersion(c.cur, c.latest); got != c.want {
 			t.Errorf("isNewerVersion(%q,%q) = %v, want %v", c.cur, c.latest, got, c.want)
 		}
+	}
+}
+
+func TestUpgradeRefusesUnsignedRelease(t *testing.T) {
+	// Signature over the wrong content must be rejected.
+	fx := setupUpgrade(t, nil, false)
+	oldPub := releasePublicKey
+	releasePublicKey = func() (*rsa.PublicKey, error) {
+		other, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &other.PublicKey, nil
+	}
+	t.Cleanup(func() { releasePublicKey = oldPub })
+
+	if err := runUpgrade(); !errors.Is(err, errSilent) {
+		t.Fatalf("expected refusal for a bad signature, got %v", err)
+	}
+	if installed(t, fx) != "OLD" {
+		t.Error("binary replaced despite an invalid signature")
 	}
 }

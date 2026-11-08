@@ -13,6 +13,12 @@ $ErrorActionPreference = "Stop"
 
 $Repo = "airbuild/airbuild-cli"
 
+# AirBuild release-signing public key (RSA-3072, XML form for .NET). The private
+# key lives only in the GitHub release workflow's secrets. checksums.txt.sig is
+# an RSA-SHA256 signature over checksums.txt — a tampered release, including a
+# swapped checksums.txt, fails verification.
+$ReleasePubXml = "$PUBXML"
+
 # --- Detect platform ---
 $Os = "windows"
 $Arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "arm64" }
@@ -68,6 +74,29 @@ try {
     Write-Host "Could not download checksums.txt - refusing to install an unverified binary." -ForegroundColor Red
     exit 1
 }
+$SigFile = Join-Path $env:TEMP "airbuild-checksums.sig"
+try {
+    Invoke-WebRequest -Uri "$BaseUrl/checksums.txt.sig" -OutFile $SigFile -UseBasicParsing
+} catch {
+    Remove-Item $TempFile, $SumFile -Force -ErrorAction SilentlyContinue
+    Write-Host "Could not download checksums.txt.sig - refusing to install an unsigned release." -ForegroundColor Red
+    exit 1
+}
+
+# --- Verify authenticity: checksums.txt was signed by AirBuild's release key ---
+$SumBytes = [IO.File]::ReadAllBytes($SumFile)
+$SigBytes = [IO.File]::ReadAllBytes($SigFile)
+$Rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+$Rsa.FromXmlString($ReleasePubXml)
+$SigOk = $Rsa.VerifyData($SumBytes, "SHA256", $SigBytes)
+Remove-Item $SigFile -Force -ErrorAction SilentlyContinue
+if (-not $SigOk) {
+    Remove-Item $TempFile, $SumFile -Force -ErrorAction SilentlyContinue
+    Write-Host "Release signature verification failed - this release was not signed by AirBuild." -ForegroundColor Red
+    Write-Host "Refusing to install." -ForegroundColor Red
+    exit 1
+}
+Write-Host "Release signature verified" -ForegroundColor Green
 
 # --- Verify integrity (SHA-256) ---
 $Expected = $null
