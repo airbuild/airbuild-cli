@@ -328,6 +328,7 @@ type UploadResponse struct {
 		BuildNumber string `json:"buildNumber"`
 		Platform    string `json:"platform"`
 		Status      string `json:"status"`
+		ScanStatus  string `json:"scanStatus"`
 	} `json:"build"`
 	InstallLink struct {
 		ID   string `json:"id"`

@@ -100,6 +100,9 @@ Examples:
 		)
 		fmt.Println()
 		ui.Info("Install URL: %s", resp.InstallURL)
+		if resp.Build.ScanStatus == "PENDING" {
+			ui.Info("Virus scan in progress — the install link activates once the scan completes")
+		}
 		return nil
 	},
 }

@@ -192,6 +192,9 @@ func pushSingle(client *api.Client, projCfg *project.ProjectConfig, platform, bu
 	}
 
 	ui.Success("Uploaded %s %s in %s", platform, buildType, elapsed)
+	if resp.Build.ScanStatus == "PENDING" {
+		ui.Info("Virus scan in progress — the install link activates once the scan completes")
+	}
 	return result
 }
 
