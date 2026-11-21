@@ -2,7 +2,9 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -138,6 +140,11 @@ func TestUploadStreamsWithExactContentLengthAndReportsProgress(t *testing.T) {
 	var gotFields = map[string]string{}
 	var gotFileSize int
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Legacy server without direct upload — forces the multipart fallback.
+		if r.URL.Path == "/api/upload/init" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		gotLen = r.ContentLength
 		if len(r.TransferEncoding) != 0 {
 			t.Errorf("upload used chunked encoding %v, want fixed Content-Length", r.TransferEncoding)
@@ -193,6 +200,10 @@ func TestUploadOmitsEmptyOptionalFields(t *testing.T) {
 	file := writeTemp(t, "a.ipa", 10)
 	var names []string
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/upload/init" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		_, params, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		mr := multipart.NewReader(r.Body, params["boundary"])
 		for {
@@ -209,6 +220,80 @@ func TestUploadOmitsEmptyOptionalFields(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "appId,file" {
 		t.Errorf("parts = %v, want appId,file", names)
+	}
+}
+
+func TestUploadDirectToStorage(t *testing.T) {
+	const size = 1<<20 + 7
+	file := writeTemp(t, "app.apk", size)
+
+	var putBytes, putLen int64
+	var gotInit, gotFinalize bool
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/upload/init":
+			gotInit = true
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+			if body["fileSizeBytes"].(float64) != float64(size) {
+				t.Errorf("init fileSizeBytes = %v, want %d", body["fileSizeBytes"], size)
+			}
+			fmt.Fprintf(w, `{"uploadId":"u1","uploadUrl":%q}`, srv.URL+"/storage/obj")
+		case "/storage/obj":
+			if r.Method != http.MethodPut {
+				t.Errorf("storage write used %s, want PUT", r.Method)
+			}
+			putLen = r.ContentLength
+			putBytes, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusOK)
+		case "/api/upload/finalize":
+			gotFinalize = true
+			w.Write([]byte(`{"build":{"id":"b1","version":"1.0"},"installLink":{"slug":"s"},"installUrl":"u"}`)) //nolint:errcheck
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "airbuild_testkey")
+	c.backoff = time.Millisecond
+
+	var lastSent, lastTotal int64
+	c.Progress = func(sent, total int64) { lastSent, lastTotal = sent, total }
+	resp, err := c.Upload(file, "app1", "ANDROID", "notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gotInit || !gotFinalize {
+		t.Error("expected init and finalize calls")
+	}
+	if putLen != size || putBytes != size {
+		t.Errorf("storage got %d bytes (Content-Length %d), want %d", putBytes, putLen, size)
+	}
+	if resp.Build.ID != "b1" {
+		t.Errorf("build id = %q", resp.Build.ID)
+	}
+	if lastSent != size || lastTotal != size {
+		t.Errorf("progress ended at %d/%d, want %d/%d", lastSent, lastTotal, size, size)
+	}
+}
+
+func TestUploadFallsBackWhenInitUnsupported(t *testing.T) {
+	file := writeTemp(t, "a.apk", 100)
+	var usedMultipart bool
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/upload/init" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		usedMultipart = true
+		w.Write([]byte(`{"build":{"id":"b1"},"installLink":{"slug":"s"},"installUrl":"u"}`)) //nolint:errcheck
+	}))
+	if _, err := c.Upload(file, "app1", "ANDROID", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !usedMultipart {
+		t.Error("expected fallback to multipart /api/upload")
 	}
 }
 

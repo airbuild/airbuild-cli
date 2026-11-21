@@ -933,9 +933,110 @@ func (c *Client) DownloadFile(fileURL, destPath string) error {
 	return nil
 }
 
+// uploadInitResponse is returned by POST /api/upload/init.
+type uploadInitResponse struct {
+	UploadID         string `json:"uploadId"`
+	UploadURL        string `json:"uploadUrl"`
+	ExpiresInSeconds int    `json:"expiresInSeconds"`
+}
+
+// progressReader wraps a file so c.Progress receives (sent, total) while the
+// presigned PUT streams to storage.
+type progressReader struct {
+	r     io.Reader
+	sent  int64
+	total int64
+	fn    func(sent, total int64)
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.sent += int64(n)
+	if n > 0 && p.fn != nil {
+		p.fn(p.sent, p.total)
+	}
+	return n, err
+}
+
 // Upload streams a build file (IPA/APK) to a specific app. Set c.Progress to
 // receive (sent, total) byte counts while it uploads.
+//
+// Preferred path is direct-to-storage (init → presigned PUT → finalize),
+// which bypasses any request-body cap in front of the app. Servers without
+// the new endpoints (404 on init) fall back to the legacy multipart upload.
 func (c *Client) Upload(filePath, appID, platform, releaseNotes string) (*UploadResponse, error) {
+	resp, err := c.uploadDirect(filePath, appID, platform, releaseNotes)
+	if err == nil {
+		return resp, nil
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return nil, err
+	}
+	return c.uploadMultipart(filePath, appID, platform, releaseNotes)
+}
+
+func (c *Client) uploadDirect(filePath, appID, platform, releaseNotes string) (*UploadResponse, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	var init uploadInitResponse
+	if err := c.postJSON("/api/upload/init", map[string]interface{}{
+		"appId":         appID,
+		"fileName":      info.Name(),
+		"fileSizeBytes": info.Size(),
+		"platform":      platform,
+	}, &init); err != nil {
+		return nil, err
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close() //nolint:errcheck
+
+	putReq, err := http.NewRequest(http.MethodPut, init.UploadURL,
+		&progressReader{r: f, total: info.Size(), fn: c.Progress})
+	if err != nil {
+		return nil, fmt.Errorf("could not create storage upload request: %w", err)
+	}
+	// ContentLength is signed into the URL — must match the declared size.
+	putReq.ContentLength = info.Size()
+	putResp, err := c.UploadHTTP.Do(putReq)
+	if err != nil {
+		return nil, fmt.Errorf("storage upload failed: %w", err)
+	}
+	io.Copy(io.Discard, putResp.Body) //nolint:errcheck
+	putResp.Body.Close()              //nolint:errcheck
+	if putResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("storage upload rejected (HTTP %d)", putResp.StatusCode)
+	}
+
+	// Finalize can take a while — the server pulls the object back for
+	// checksum/metadata — so it goes over the upload client, not postJSON.
+	finBody, _ := json.Marshal(map[string]interface{}{
+		"appId":        appID,
+		"uploadId":     init.UploadID,
+		"fileName":     info.Name(),
+		"platform":     platform,
+		"releaseNotes": releaseNotes,
+	})
+	data, _, _, err := c.send(c.UploadHTTP, uploadResponseTimeout, http.MethodPost,
+		"/api/upload/finalize", bytes.NewReader(finBody), int64(len(finBody)), "application/json")
+	if err != nil {
+		return nil, err
+	}
+	var resp UploadResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("could not parse finalize response: %w", err)
+	}
+	return &resp, nil
+}
+
+func (c *Client) uploadMultipart(filePath, appID, platform, releaseNotes string) (*UploadResponse, error) {
 	data, err := c.postMultipart("/api/upload", map[string]string{
 		"appId":        appID,
 		"platform":     platform,
